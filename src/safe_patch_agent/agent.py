@@ -1,0 +1,106 @@
+"""第一阶段的只读 Tool Calling 循环。"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from safe_patch_agent.llm_client import LLMClient
+from safe_patch_agent.messages import ChatMessage
+from safe_patch_agent.tooling import ToolRegistry
+
+SYSTEM_PROMPT = """你是 SafePatch Agent，一个只读的编程助手。
+
+工作区工具是你了解项目内容的唯一可靠来源。当任务依赖项目内容时，必须先检查工作区再回答。
+所有路径都必须是相对于已配置工作区的相对路径。如果工具返回错误，请修正调用参数，或者明确
+说明当前限制。本阶段严格只读：不得声称自己创建、修改、删除、测试或执行了项目文件。
+
+请根据你实际检查过的文件，给出简洁、准确的最终回答。
+"""
+
+
+class AgentError(RuntimeError):
+    """Agent 运行时异常的基类。"""
+
+
+class AgentLoopLimitError(AgentError):
+    """模型在循环上限内始终没有给出最终答案。"""
+
+
+class AgentToolLimitError(AgentError):
+    """模型请求的工具调用总数超过上限。"""
+
+
+@dataclass(frozen=True)
+class AgentResult:
+    answer: str
+    model_rounds: int
+    tool_calls: int
+    messages: tuple[ChatMessage, ...]
+
+
+class CodingAgent:
+    """在模型与已注册工具之间循环，直到获得最终答案。"""
+
+    def __init__(
+        self,
+        client: LLMClient,
+        registry: ToolRegistry,
+        *,
+        max_rounds: int = 8,
+        max_tool_calls: int = 32,
+        system_prompt: str = SYSTEM_PROMPT,
+    ) -> None:
+        if max_rounds < 1:
+            raise ValueError("max_rounds 必须至少为 1")
+        if max_tool_calls < 1:
+            raise ValueError("max_tool_calls 必须至少为 1")
+        self.client = client
+        self.registry = registry
+        self.max_rounds = max_rounds
+        self.max_tool_calls = max_tool_calls
+        self.system_prompt = system_prompt
+
+    def run(self, goal: str) -> AgentResult:
+        goal = goal.strip()
+        if not goal:
+            raise ValueError("任务目标不能为空")
+
+        messages = [ChatMessage.system(self.system_prompt), ChatMessage.user(goal)]
+        tool_call_count = 0
+
+        for round_number in range(1, self.max_rounds + 1):
+            completion = self.client.complete(messages, self.registry.schemas())
+            assistant_message = completion.message
+            messages.append(assistant_message)
+
+            if completion.finish_reason == "length":
+                raise AgentError("模型输出在完整轮次结束前被截断")
+            if completion.finish_reason == "content_filter":
+                raise AgentError("模型输出被服务提供方的内容过滤器中止")
+
+            if not assistant_message.tool_calls:
+                if completion.finish_reason == "tool_calls":
+                    raise AgentError("模型报告需要调用工具，但没有返回任何工具调用")
+                answer = (assistant_message.content or "").strip()
+                if not answer:
+                    raise AgentError("模型既没有返回工具调用，也没有给出最终答案")
+                return AgentResult(
+                    answer=answer,
+                    model_rounds=round_number,
+                    tool_calls=tool_call_count,
+                    messages=tuple(messages),
+                )
+
+            requested_call_count = len(assistant_message.tool_calls)
+            if tool_call_count + requested_call_count > self.max_tool_calls:
+                raise AgentToolLimitError(
+                    f"Agent 已达到 {self.max_tool_calls} 次工具调用上限"
+                )
+            for call in assistant_message.tool_calls:
+                tool_call_count += 1
+                result = self.registry.execute(call)
+                messages.append(ChatMessage.tool(call, result))
+
+        raise AgentLoopLimitError(
+            f"Agent 已达到 {self.max_rounds} 轮模型调用上限，但仍未获得最终答案"
+        )

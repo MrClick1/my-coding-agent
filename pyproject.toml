@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "safe-patch-agent"
+version = "0.1.0"
+description = "一个用于学习、强调安全边界的轻量编程 Agent。"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "ruff",
+]
+
+[project.scripts]
+safe-patch-agent = "safe_patch_agent.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = [".uv-cache"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
