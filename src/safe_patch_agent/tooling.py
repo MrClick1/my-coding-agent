@@ -13,6 +13,7 @@ from safe_patch_agent.messages import ToolCall
 from safe_patch_agent.state import AgentState
 
 ToolHandler = Callable[..., Any]
+PathNormalizer = Callable[[str], str]
 
 
 class ToolRegistrationError(ValueError):
@@ -36,6 +37,7 @@ class ToolDefinition:
     handler: ToolHandler
     file_access: ToolFileAccess | None = None
     path_argument: str | None = None
+    path_normalizer: PathNormalizer | None = None
 
     def __post_init__(self) -> None:
         if not self.name:
@@ -57,6 +59,12 @@ class ToolDefinition:
             not isinstance(self.path_argument, str) or not self.path_argument
         ):
             raise ToolRegistrationError(f"工具 {self.name!r} 的 path_argument 不能为空")
+        if self.path_normalizer is not None and self.file_access is None:
+            raise ToolRegistrationError(
+                f"工具 {self.name!r} 只有配置文件访问类型后才能使用 path_normalizer"
+            )
+        if self.path_normalizer is not None and not callable(self.path_normalizer):
+            raise ToolRegistrationError(f"工具 {self.name!r} 的 path_normalizer 必须可调用")
 
     def to_api_dict(self) -> dict[str, Any]:
         return {
@@ -163,6 +171,10 @@ class ToolRegistry:
         path = arguments.get(definition.path_argument)
         if not isinstance(path, str):
             raise ValueError(f"工具参数 {definition.path_argument!r} 必须是字符串")
+        if definition.path_normalizer is not None:
+            path = definition.path_normalizer(path)
+            if not isinstance(path, str) or not path:
+                raise ValueError("工具的路径规范化器必须返回非空字符串")
         if definition.file_access is ToolFileAccess.WRITE:
             self.state.require_file_read(path)
         return path
@@ -180,6 +192,7 @@ class ToolRegistry:
         result_path = (
             requested_path
             if definition.file_access is ToolFileAccess.WRITE
+            or definition.path_normalizer is not None
             else payload.get("path", requested_path)
         )
         if not isinstance(result_path, str):

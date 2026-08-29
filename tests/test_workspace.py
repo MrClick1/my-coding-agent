@@ -5,7 +5,12 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from safe_patch_agent.messages import ToolCall
-from safe_patch_agent.workspace import SafeWorkspace, WorkspaceError, build_read_only_registry
+from safe_patch_agent.workspace import (
+    SafeWorkspace,
+    WorkspaceError,
+    build_agent_registry,
+    build_read_only_registry,
+)
 
 
 class WorkspaceTests(unittest.TestCase):
@@ -282,6 +287,184 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(parameters["required"], ["query"])
         self.assertFalse(parameters["additionalProperties"])
         self.assertEqual(parameters["properties"]["max_results"]["default"], 50)
+
+    def test_replace_text_changes_exact_expected_occurrences(self) -> None:
+        target = self.root / "replace.py"
+        target.write_text("old = 1\nold = 1\n", encoding="utf-8")
+
+        result = self.workspace.replace_text(
+            "replace.py",
+            "old = 1",
+            "new = 2",
+            expected_replacements=2,
+        )
+
+        self.assertEqual(target.read_text(encoding="utf-8"), "new = 2\nnew = 2\n")
+        self.assertEqual(result["replacements"], 2)
+        self.assertEqual(result["path"], "replace.py")
+
+    def test_replace_text_mismatch_leaves_file_unchanged(self) -> None:
+        target = self.root / "replace.py"
+        original = "same\nsame\n"
+        target.write_text(original, encoding="utf-8")
+
+        for expected_replacements in (1, 3):
+            with (
+                self.subTest(expected_replacements=expected_replacements),
+                self.assertRaisesRegex(WorkspaceError, "实际 2 次"),
+            ):
+                self.workspace.replace_text(
+                    "replace.py",
+                    "same",
+                    "changed",
+                    expected_replacements=expected_replacements,
+                )
+            self.assertEqual(target.read_text(encoding="utf-8"), original)
+
+        with self.assertRaisesRegex(WorkspaceError, "实际 0 次"):
+            self.workspace.replace_text("replace.py", "missing", "changed")
+        self.assertEqual(target.read_text(encoding="utf-8"), original)
+
+    def test_replace_text_rejects_invalid_parameters_without_writing(self) -> None:
+        target = self.root / "replace.py"
+        target.write_text("old\n", encoding="utf-8")
+
+        invalid_calls = [
+            {"old_text": "", "new_text": "new"},
+            {"old_text": "old", "new_text": "old"},
+            {"old_text": "old", "new_text": "new", "expected_replacements": 0},
+            {"old_text": "old", "new_text": "new", "expected_replacements": 101},
+            {"old_text": "old", "new_text": "new", "expected_replacements": True},
+            {"old_text": "old\x00", "new_text": "new"},
+        ]
+        for arguments in invalid_calls:
+            with self.subTest(arguments=arguments), self.assertRaises(WorkspaceError):
+                self.workspace.replace_text("replace.py", **arguments)  # type: ignore[arg-type]
+
+        self.assertEqual(target.read_text(encoding="utf-8"), "old\n")
+
+    def test_replace_text_rejects_oversized_result_without_writing(self) -> None:
+        target = self.root / "replace.py"
+        target.write_text("old\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(WorkspaceError, "替换后的文件超过"):
+            self.workspace.replace_text("replace.py", "old", "x" * 1_000_001)
+
+        self.assertEqual(target.read_text(encoding="utf-8"), "old\n")
+
+    def test_replace_text_rejects_sensitive_and_non_text_files(self) -> None:
+        (self.root / ".env").write_text("TOKEN=old\n", encoding="utf-8")
+        (self.root / "binary.bin").write_bytes(b"old\x00value")
+
+        with self.assertRaisesRegex(WorkspaceError, "敏感文件"):
+            self.workspace.replace_text(".env", "old", "new")
+        with self.assertRaisesRegex(WorkspaceError, "NUL"):
+            self.workspace.replace_text("binary.bin", "old", "new")
+
+    def test_replace_text_registry_enforces_read_before_write(self) -> None:
+        target = self.root / "replace.py"
+        target.write_text("old\n", encoding="utf-8")
+        registry = build_agent_registry(self.workspace)
+        replace_call = ToolCall(
+            id="replace",
+            name="replace_text",
+            arguments={
+                "path": "replace.py",
+                "old_text": "old",
+                "new_text": "new",
+            },
+        )
+
+        blocked = json.loads(registry.execute(replace_call))
+        registry.execute(
+            ToolCall(id="read", name="read_file", arguments={"path": "replace.py"})
+        )
+        allowed = json.loads(registry.execute(replace_call))
+
+        self.assertFalse(blocked["ok"])
+        self.assertEqual(target.read_text(encoding="utf-8"), "new\n")
+        self.assertTrue(allowed["ok"])
+        self.assertEqual(registry.state.snapshot().modified_files, ("replace.py",))
+
+    def test_replace_text_uses_canonical_path_for_read_authorization(self) -> None:
+        target = self.root / "replace.py"
+        target.write_text("old\n", encoding="utf-8")
+        (self.root / "subdirectory").mkdir()
+        registry = build_agent_registry(self.workspace)
+        registry.execute(
+            ToolCall(
+                id="read",
+                name="read_file",
+                arguments={"path": "./replace.py"},
+            )
+        )
+
+        result = json.loads(
+            registry.execute(
+                ToolCall(
+                    id="replace",
+                    name="replace_text",
+                    arguments={
+                        "path": "subdirectory/../replace.py",
+                        "old_text": "old",
+                        "new_text": "new",
+                    },
+                )
+            )
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(target.read_text(encoding="utf-8"), "new\n")
+        self.assertEqual(registry.state.snapshot().read_files, ("replace.py",))
+        self.assertEqual(registry.state.snapshot().modified_files, ("replace.py",))
+
+    def test_failed_replace_is_not_recorded_as_modified(self) -> None:
+        target = self.root / "replace.py"
+        target.write_text("old old\n", encoding="utf-8")
+        registry = build_agent_registry(self.workspace)
+        registry.execute(
+            ToolCall(id="read", name="read_file", arguments={"path": "replace.py"})
+        )
+
+        result = json.loads(
+            registry.execute(
+                ToolCall(
+                    id="replace",
+                    name="replace_text",
+                    arguments={
+                        "path": "replace.py",
+                        "old_text": "old",
+                        "new_text": "new",
+                    },
+                )
+            )
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(target.read_text(encoding="utf-8"), "old old\n")
+        self.assertEqual(registry.state.snapshot().modified_files, ())
+
+    def test_agent_registry_exposes_replace_text_schema(self) -> None:
+        registry = build_agent_registry(self.workspace)
+        tool_names = {schema["function"]["name"] for schema in registry.schemas()}
+        replace_schema = next(
+            schema
+            for schema in registry.schemas()
+            if schema["function"]["name"] == "replace_text"
+        )["function"]["parameters"]
+
+        self.assertEqual(
+            tool_names,
+            {"list_files", "read_file", "search_code", "replace_text"},
+        )
+        self.assertEqual(
+            replace_schema["required"],
+            ["path", "old_text", "new_text"],
+        )
+        self.assertEqual(
+            replace_schema["properties"]["expected_replacements"]["default"],
+            1,
+        )
 
     def test_empty_file_has_an_explicit_zero_line_range(self) -> None:
         (self.root / "empty.txt").write_text("", encoding="utf-8")

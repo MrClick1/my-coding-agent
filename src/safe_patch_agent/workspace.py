@@ -1,10 +1,12 @@
-"""工作区边界检查，以及目录、搜索和读取三个只读编程工具。"""
+"""工作区边界检查，以及目录、搜索、读取和精确替换工具。"""
 
 from __future__ import annotations
 
 import json
 import os
 import re
+import stat
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +30,7 @@ class SafeWorkspace:
     _MAX_SEARCH_BYTES = 20_000_000
     _MAX_SEARCH_LINE_CHARS = 500
     _MAX_SEARCH_OUTPUT_CHARS = 35_000
+    _MAX_REPLACEMENTS = 100
 
     _IGNORED_DIRECTORY_NAMES = {
         ".git",
@@ -102,6 +105,14 @@ class SafeWorkspace:
         relative = path.relative_to(self.root)
         text = relative.as_posix()
         return text if text else "."
+
+    def canonical_file_path(self, path: str) -> str:
+        """返回通过安全检查的规范化文件相对路径。"""
+
+        target = self.resolve(path)
+        if not target.is_file():
+            raise WorkspaceError(f"路径不是文件：{path}")
+        return self.display_path(target)
 
     def list_files(self, path: str = ".", max_results: int = 200) -> dict[str, Any]:
         """列出安全相对路径下的项目文件和目录。"""
@@ -354,6 +365,67 @@ class SafeWorkspace:
             "complete": not truncated and skipped_files == 0 and skipped_directories == 0,
         }
 
+    def replace_text(
+        self,
+        path: str,
+        old_text: str,
+        new_text: str,
+        expected_replacements: int = 1,
+    ) -> dict[str, Any]:
+        """精确校验出现次数后，以原子方式替换 UTF-8 文件中的字面量。"""
+
+        if not isinstance(old_text, str) or not old_text:
+            raise WorkspaceError("old_text 必须是非空字符串")
+        if not isinstance(new_text, str):
+            raise WorkspaceError("new_text 必须是字符串")
+        if "\x00" in old_text or "\x00" in new_text:
+            raise WorkspaceError("替换文本不能包含 NUL 字符")
+        if old_text == new_text:
+            raise WorkspaceError("old_text 和 new_text 不能完全相同")
+        if not isinstance(expected_replacements, int) or isinstance(
+            expected_replacements,
+            bool,
+        ):
+            raise WorkspaceError("expected_replacements 必须是整数")
+        if not 1 <= expected_replacements <= self._MAX_REPLACEMENTS:
+            raise WorkspaceError(
+                f"expected_replacements 必须在 1 到 {self._MAX_REPLACEMENTS} 之间"
+            )
+
+        target = self.resolve(path)
+        if not target.is_file():
+            raise WorkspaceError(f"路径不是文件：{path}")
+        display_path = self.display_path(target)
+        original_text, original_bytes = self._read_utf8_text(target, display_path)
+        if "\x00" in original_text:
+            raise WorkspaceError(f"文件包含 NUL 字符，拒绝按文本修改：{display_path}")
+
+        actual_replacements = original_text.count(old_text)
+        if actual_replacements != expected_replacements:
+            raise WorkspaceError(
+                "替换次数不符合预期："
+                f"期望 {expected_replacements} 次，实际 {actual_replacements} 次；文件未修改"
+            )
+
+        updated_text = original_text.replace(old_text, new_text)
+        try:
+            updated_bytes = updated_text.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise WorkspaceError("new_text 不能编码为有效的 UTF-8") from exc
+        if len(updated_bytes) > self._MAX_FILE_BYTES:
+            raise WorkspaceError(
+                f"替换后的文件超过 {self._MAX_FILE_BYTES} 字节上限；文件未修改"
+            )
+
+        self._atomic_write(target, updated_bytes)
+        return {
+            "ok": True,
+            "path": display_path,
+            "replacements": actual_replacements,
+            "original_bytes": original_bytes,
+            "updated_bytes": len(updated_bytes),
+        }
+
     def _read_utf8_text(self, target: Path, display_path: str) -> tuple[str, int]:
         """在固定字节上限内读取 UTF-8 文本。"""
 
@@ -396,6 +468,39 @@ class SafeWorkspace:
         if "\x00" in text:
             return None, len(raw_content), False
         return text, len(raw_content), False
+
+    @staticmethod
+    def _atomic_write(target: Path, content: bytes) -> None:
+        """在目标目录创建临时文件，并使用原子替换提交完整内容。"""
+
+        descriptor: int | None = None
+        temporary_path: Path | None = None
+        try:
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=f".{target.name}.",
+                suffix=".tmp",
+                dir=target.parent,
+            )
+            temporary_path = Path(temporary_name)
+            with os.fdopen(descriptor, "wb") as file:
+                descriptor = None
+                file.write(content)
+                file.flush()
+                os.fsync(file.fileno())
+            original_mode = stat.S_IMODE(target.stat().st_mode)
+            os.chmod(temporary_path, original_mode)
+            os.replace(temporary_path, target)
+            temporary_path = None
+        except OSError as exc:
+            raise WorkspaceError(f"无法安全写入文件：{target.name}") from exc
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            if temporary_path is not None:
+                try:
+                    temporary_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     def _collect_visible_search_files(
         self,
@@ -577,6 +682,7 @@ def build_read_only_registry(workspace: SafeWorkspace) -> ToolRegistry:
             handler=workspace.read_file,
             file_access=ToolFileAccess.READ,
             path_argument="path",
+            path_normalizer=workspace.canonical_file_path,
         )
     )
     registry.register(
@@ -613,6 +719,54 @@ def build_read_only_registry(workspace: SafeWorkspace) -> ToolRegistry:
                 "additionalProperties": False,
             },
             handler=workspace.search_code,
+        )
+    )
+    return registry
+
+
+def build_agent_registry(workspace: SafeWorkspace) -> ToolRegistry:
+    """创建包含受控精确修改能力的 Agent 工具注册表。"""
+
+    registry = build_read_only_registry(workspace)
+    registry.register(
+        ToolDefinition(
+            name="replace_text",
+            description=(
+                "精确替换已读取 UTF-8 文件中的字面量。实际出现次数必须与"
+                " expected_replacements 完全一致，否则不会修改文件。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "要修改的工作区相对文件路径。",
+                        "minLength": 1,
+                    },
+                    "old_text": {
+                        "type": "string",
+                        "description": "必须原样存在的非空旧文本。",
+                        "minLength": 1,
+                    },
+                    "new_text": {
+                        "type": "string",
+                        "description": "用于替换的新文本，可以为空字符串。",
+                    },
+                    "expected_replacements": {
+                        "type": "integer",
+                        "description": "旧文本预期出现次数，取值范围为 1 到 100。",
+                        "default": 1,
+                        "minimum": 1,
+                        "maximum": 100,
+                    },
+                },
+                "required": ["path", "old_text", "new_text"],
+                "additionalProperties": False,
+            },
+            handler=workspace.replace_text,
+            file_access=ToolFileAccess.WRITE,
+            path_argument="path",
+            path_normalizer=workspace.canonical_file_path,
         )
     )
     return registry

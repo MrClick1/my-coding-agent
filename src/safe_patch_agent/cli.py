@@ -10,7 +10,7 @@ from pathlib import Path
 from safe_patch_agent.agent import AgentError, CodingAgent
 from safe_patch_agent.config import ConfigurationError, LLMConfig
 from safe_patch_agent.llm_client import LLMError, OpenAICompatibleClient
-from safe_patch_agent.workspace import SafeWorkspace, WorkspaceError, build_read_only_registry
+from safe_patch_agent.workspace import SafeWorkspace, WorkspaceError, build_agent_registry
 
 
 class ChineseArgumentParser(argparse.ArgumentParser):
@@ -30,7 +30,7 @@ class ChineseArgumentParser(argparse.ArgumentParser):
 def build_parser() -> argparse.ArgumentParser:
     parser = ChineseArgumentParser(
         prog="safe-patch-agent",
-        description="运行具备代码搜索能力的只读编程 Agent。",
+        description="运行具备代码搜索和精确替换能力的编程 Agent。",
         add_help=False,
     )
     parser._positionals.title = "位置参数"
@@ -70,7 +70,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         config = LLMConfig.load(args.env_file)
         workspace = SafeWorkspace(args.workspace)
-        registry = build_read_only_registry(workspace)
+        registry = build_agent_registry(workspace)
         client = OpenAICompatibleClient(config)
         result = CodingAgent(
             client=client,

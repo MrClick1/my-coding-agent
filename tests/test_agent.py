@@ -9,7 +9,7 @@ from safe_patch_agent.agent import AgentLoopLimitError, AgentToolLimitError, Cod
 from safe_patch_agent.llm_client import ChatCompletion
 from safe_patch_agent.messages import ChatMessage, ToolCall
 from safe_patch_agent.tooling import ToolRegistry
-from safe_patch_agent.workspace import SafeWorkspace, build_read_only_registry
+from safe_patch_agent.workspace import SafeWorkspace, build_agent_registry, build_read_only_registry
 
 
 class ScriptedClient:
@@ -44,7 +44,7 @@ class AgentTests(unittest.TestCase):
         with TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             (root / "README.md").write_text("# Demo\n", encoding="utf-8")
-            registry = build_read_only_registry(SafeWorkspace(root))
+            registry = build_agent_registry(SafeWorkspace(root))
             call = ToolCall(id="call-1", name="list_files", arguments={"path": "."})
             client = ScriptedClient(
                 [
@@ -65,7 +65,7 @@ class AgentTests(unittest.TestCase):
         self.assertTrue(json.loads(tool_message.content)["ok"])
         self.assertEqual(
             {tool["function"]["name"] for tool in client.requests[0][1]},
-            {"list_files", "read_file", "search_code"},
+            {"list_files", "read_file", "replace_text", "search_code"},
         )
 
     def test_loop_limit_stops_repeated_tool_calls(self) -> None:
@@ -110,7 +110,7 @@ class AgentTests(unittest.TestCase):
         with TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             (root / "README.md").write_text("# Demo\n", encoding="utf-8")
-            registry = build_read_only_registry(SafeWorkspace(root))
+            registry = build_agent_registry(SafeWorkspace(root))
             read_call = ToolCall(
                 id="read",
                 name="read_file",
@@ -131,6 +131,45 @@ class AgentTests(unittest.TestCase):
 
         self.assertEqual(first_result.state.read_files, ("README.md",))
         self.assertEqual(second_result.state.read_files, ())
+
+    def test_agent_can_replace_text_only_after_reading_target(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            target = root / "demo.py"
+            target.write_text("value = 1\n", encoding="utf-8")
+            registry = build_agent_registry(SafeWorkspace(root))
+            read_call = ToolCall(
+                id="read",
+                name="read_file",
+                arguments={"path": "demo.py"},
+            )
+            replace_call = ToolCall(
+                id="replace",
+                name="replace_text",
+                arguments={
+                    "path": "demo.py",
+                    "old_text": "value = 1",
+                    "new_text": "value = 2",
+                },
+            )
+            client = ScriptedClient(
+                [
+                    ChatCompletion(ChatMessage.assistant(None, (read_call,)), "tool_calls"),
+                    ChatCompletion(
+                        ChatMessage.assistant(None, (replace_call,)),
+                        "tool_calls",
+                    ),
+                    ChatCompletion(ChatMessage.assistant("修改完成。"), "stop"),
+                ]
+            )
+
+            result = CodingAgent(client, registry).run("把 value 改为 2")
+            updated_content = target.read_text(encoding="utf-8")
+
+        self.assertEqual(updated_content, "value = 2\n")
+        self.assertEqual(result.tool_calls, 2)
+        self.assertEqual(result.state.read_files, ("demo.py",))
+        self.assertEqual(result.state.modified_files, ("demo.py",))
 
 
 if __name__ == "__main__":
