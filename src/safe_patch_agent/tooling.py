@@ -6,15 +6,24 @@ import inspect
 import json
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any
 
 from safe_patch_agent.messages import ToolCall
+from safe_patch_agent.state import AgentState
 
 ToolHandler = Callable[..., Any]
 
 
 class ToolRegistrationError(ValueError):
     """工具定义无法注册。"""
+
+
+class ToolFileAccess(StrEnum):
+    """工具对路径参数所指文件执行的访问类型。"""
+
+    READ = "read"
+    WRITE = "write"
 
 
 @dataclass(frozen=True)
@@ -25,12 +34,29 @@ class ToolDefinition:
     description: str
     parameters: Mapping[str, Any]
     handler: ToolHandler
+    file_access: ToolFileAccess | None = None
+    path_argument: str | None = None
 
     def __post_init__(self) -> None:
         if not self.name:
             raise ToolRegistrationError("工具名称不能为空")
         if not callable(self.handler):
             raise ToolRegistrationError(f"工具 {self.name!r} 的 handler 必须可调用")
+        if self.file_access is not None and not isinstance(self.file_access, ToolFileAccess):
+            try:
+                object.__setattr__(self, "file_access", ToolFileAccess(self.file_access))
+            except (TypeError, ValueError) as exc:
+                raise ToolRegistrationError(
+                    f"工具 {self.name!r} 的 file_access 无效"
+                ) from exc
+        if (self.file_access is None) != (self.path_argument is None):
+            raise ToolRegistrationError(
+                f"工具 {self.name!r} 必须同时配置 file_access 和 path_argument"
+            )
+        if self.path_argument is not None and (
+            not isinstance(self.path_argument, str) or not self.path_argument
+        ):
+            raise ToolRegistrationError(f"工具 {self.name!r} 的 path_argument 不能为空")
 
     def to_api_dict(self) -> dict[str, Any]:
         return {
@@ -46,8 +72,9 @@ class ToolDefinition:
 class ToolRegistry:
     """注册工具、公开工具 Schema，并安全执行模型请求。"""
 
-    def __init__(self) -> None:
+    def __init__(self, state: AgentState | None = None) -> None:
         self._tools: dict[str, ToolDefinition] = {}
+        self.state = state or AgentState()
 
     def register(self, definition: ToolDefinition) -> None:
         if definition.name in self._tools:
@@ -96,7 +123,14 @@ class ToolRegistry:
                 )
 
         try:
+            accessed_path = self._prepare_file_access(definition, arguments)
             result = definition.handler(**arguments)
+            if isinstance(result, Mapping):
+                payload: Any = dict(result)
+            else:
+                payload = {"ok": True, "result": result}
+            if payload.get("ok", True):
+                self._record_file_access(definition, accessed_path, payload)
         except ValueError as exc:
             return _json_result(
                 {
@@ -115,11 +149,45 @@ class ToolRegistry:
                 }
             )
 
-        if isinstance(result, Mapping):
-            payload: Any = dict(result)
-        else:
-            payload = {"ok": True, "result": result}
         return _json_result(payload)
+
+    def _prepare_file_access(
+        self,
+        definition: ToolDefinition,
+        arguments: Mapping[str, Any],
+    ) -> str | None:
+        """在处理器运行前执行写入授权检查。"""
+
+        if definition.file_access is None or definition.path_argument is None:
+            return None
+        path = arguments.get(definition.path_argument)
+        if not isinstance(path, str):
+            raise ValueError(f"工具参数 {definition.path_argument!r} 必须是字符串")
+        if definition.file_access is ToolFileAccess.WRITE:
+            self.state.require_file_read(path)
+        return path
+
+    def _record_file_access(
+        self,
+        definition: ToolDefinition,
+        requested_path: str | None,
+        payload: Mapping[str, Any],
+    ) -> None:
+        """只在工具成功后记录实际访问的规范化路径。"""
+
+        if definition.file_access is None or requested_path is None:
+            return
+        result_path = (
+            requested_path
+            if definition.file_access is ToolFileAccess.WRITE
+            else payload.get("path", requested_path)
+        )
+        if not isinstance(result_path, str):
+            result_path = requested_path
+        if definition.file_access is ToolFileAccess.READ:
+            self.state.mark_file_read(result_path)
+        elif definition.file_access is ToolFileAccess.WRITE:
+            self.state.mark_file_modified(result_path)
 
 
 def _json_result(value: Any) -> str:

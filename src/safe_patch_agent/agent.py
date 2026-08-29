@@ -1,4 +1,4 @@
-"""第一阶段的只读 Tool Calling 循环。"""
+"""只读 Coding Agent 的 Tool Calling 主循环。"""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 from safe_patch_agent.llm_client import LLMClient
 from safe_patch_agent.messages import ChatMessage
+from safe_patch_agent.state import AgentStateSnapshot
 from safe_patch_agent.tooling import ToolRegistry
 
 SYSTEM_PROMPT = """你是 SafePatch Agent，一个只读的编程助手。
@@ -13,6 +14,8 @@ SYSTEM_PROMPT = """你是 SafePatch Agent，一个只读的编程助手。
 工作区工具是你了解项目内容的唯一可靠来源。当任务依赖项目内容时，必须先检查工作区再回答。
 所有路径都必须是相对于已配置工作区的相对路径。如果工具返回错误，请修正调用参数，或者明确
 说明当前限制。本阶段严格只读：不得声称自己创建、修改、删除、测试或执行了项目文件。
+
+需要定位符号、定义或引用时，优先使用 search_code 搜索，再使用 read_file 阅读命中位置的上下文。
 
 请根据你实际检查过的文件，给出简洁、准确的最终回答。
 """
@@ -36,6 +39,7 @@ class AgentResult:
     model_rounds: int
     tool_calls: int
     messages: tuple[ChatMessage, ...]
+    state: AgentStateSnapshot
 
 
 class CodingAgent:
@@ -65,6 +69,7 @@ class CodingAgent:
         if not goal:
             raise ValueError("任务目标不能为空")
 
+        self.registry.state.reset()
         messages = [ChatMessage.system(self.system_prompt), ChatMessage.user(goal)]
         tool_call_count = 0
 
@@ -89,6 +94,7 @@ class CodingAgent:
                     model_rounds=round_number,
                     tool_calls=tool_call_count,
                     messages=tuple(messages),
+                    state=self.registry.state.snapshot(),
                 )
 
             requested_call_count = len(assistant_message.tool_calls)

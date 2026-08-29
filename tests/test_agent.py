@@ -65,7 +65,7 @@ class AgentTests(unittest.TestCase):
         self.assertTrue(json.loads(tool_message.content)["ok"])
         self.assertEqual(
             {tool["function"]["name"] for tool in client.requests[0][1]},
-            {"list_files", "read_file"},
+            {"list_files", "read_file", "search_code"},
         )
 
     def test_loop_limit_stops_repeated_tool_calls(self) -> None:
@@ -105,6 +105,32 @@ class AgentTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "被截断"):
             CodingAgent(client, registry).run("查看")
+
+    def test_result_contains_read_state_and_new_run_resets_it(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "README.md").write_text("# Demo\n", encoding="utf-8")
+            registry = build_read_only_registry(SafeWorkspace(root))
+            read_call = ToolCall(
+                id="read",
+                name="read_file",
+                arguments={"path": "README.md"},
+            )
+            first_client = ScriptedClient(
+                [
+                    ChatCompletion(ChatMessage.assistant(None, (read_call,)), "tool_calls"),
+                    ChatCompletion(ChatMessage.assistant("已读取。"), "stop"),
+                ]
+            )
+
+            first_result = CodingAgent(first_client, registry).run("读取 README")
+            second_client = ScriptedClient(
+                [ChatCompletion(ChatMessage.assistant("无需工具。"), "stop")]
+            )
+            second_result = CodingAgent(second_client, registry).run("直接回答")
+
+        self.assertEqual(first_result.state.read_files, ("README.md",))
+        self.assertEqual(second_result.state.read_files, ())
 
 
 if __name__ == "__main__":

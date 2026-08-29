@@ -2,7 +2,12 @@ import json
 import unittest
 
 from safe_patch_agent.messages import ToolCall
-from safe_patch_agent.tooling import ToolDefinition, ToolRegistry
+from safe_patch_agent.tooling import (
+    ToolDefinition,
+    ToolFileAccess,
+    ToolRegistrationError,
+    ToolRegistry,
+)
 
 
 class ToolingTests(unittest.TestCase):
@@ -38,6 +43,116 @@ class ToolingTests(unittest.TestCase):
 
         self.assertEqual(result["error"]["type"], "internal_tool_error")
         self.assertNotIn("private implementation detail", serialized)
+
+    def test_write_tool_requires_successful_read_in_same_state(self) -> None:
+        writes: list[str] = []
+
+        def read_file(path: str) -> dict[str, object]:
+            return {"ok": True, "path": path, "content": "old"}
+
+        def write_file(path: str, content: str) -> dict[str, object]:
+            writes.append(content)
+            return {"ok": True, "path": path}
+
+        registry = ToolRegistry()
+        registry.register(
+            ToolDefinition(
+                "read_file",
+                "读取",
+                {"type": "object"},
+                read_file,
+                file_access=ToolFileAccess.READ,
+                path_argument="path",
+            )
+        )
+        registry.register(
+            ToolDefinition(
+                "write_file",
+                "写入",
+                {"type": "object"},
+                write_file,
+                file_access=ToolFileAccess.WRITE,
+                path_argument="path",
+            )
+        )
+
+        blocked = json.loads(
+            registry.execute(
+                ToolCall(
+                    id="write-before-read",
+                    name="write_file",
+                    arguments={"path": "demo.py", "content": "new"},
+                )
+            )
+        )
+        registry.execute(
+            ToolCall(id="read", name="read_file", arguments={"path": "demo.py"})
+        )
+        allowed = json.loads(
+            registry.execute(
+                ToolCall(
+                    id="write-after-read",
+                    name="write_file",
+                    arguments={"path": "demo.py", "content": "new"},
+                )
+            )
+        )
+
+        self.assertFalse(blocked["ok"])
+        self.assertIn("必须先使用 read_file", blocked["error"]["message"])
+        self.assertEqual(writes, ["new"])
+        self.assertTrue(allowed["ok"])
+        self.assertEqual(registry.state.snapshot().read_files, ("demo.py",))
+        self.assertEqual(registry.state.snapshot().modified_files, ("demo.py",))
+        self.assertEqual(registry.state.snapshot().blocked_write_attempts, 1)
+
+    def test_failed_read_does_not_authorize_write(self) -> None:
+        def failed_read(path: str) -> dict[str, object]:
+            return {"ok": False, "path": path}
+
+        registry = ToolRegistry()
+        registry.register(
+            ToolDefinition(
+                "read_file",
+                "读取",
+                {"type": "object"},
+                failed_read,
+                file_access=ToolFileAccess.READ,
+                path_argument="path",
+            )
+        )
+        registry.register(
+            ToolDefinition(
+                "write_file",
+                "写入",
+                {"type": "object"},
+                lambda path: {"ok": True, "path": path},
+                file_access=ToolFileAccess.WRITE,
+                path_argument="path",
+            )
+        )
+
+        registry.execute(
+            ToolCall(id="failed-read", name="read_file", arguments={"path": "demo.py"})
+        )
+        result = json.loads(
+            registry.execute(
+                ToolCall(id="write", name="write_file", arguments={"path": "demo.py"})
+            )
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(registry.state.snapshot().read_files, ())
+
+    def test_file_access_metadata_must_be_complete(self) -> None:
+        with self.assertRaisesRegex(ToolRegistrationError, "同时配置"):
+            ToolDefinition(
+                "read_file",
+                "读取",
+                {"type": "object"},
+                lambda path: path,
+                file_access=ToolFileAccess.READ,
+            )
 
 
 if __name__ == "__main__":

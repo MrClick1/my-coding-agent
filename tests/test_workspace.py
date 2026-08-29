@@ -2,6 +2,7 @@ import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from safe_patch_agent.messages import ToolCall
 from safe_patch_agent.workspace import SafeWorkspace, WorkspaceError, build_read_only_registry
@@ -37,6 +38,250 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(result["content"], "2:     return f'Hello, {name}'")
         self.assertEqual(result["start_line"], 2)
         self.assertEqual(result["end_line"], 2)
+
+    def test_search_code_returns_stable_relative_matches(self) -> None:
+        docs = self.root / "docs"
+        docs.mkdir()
+        (docs / "guide.md").write_text("Needle in docs\n", encoding="utf-8")
+        (self.root / "src" / "app.py").write_text(
+            "def greet(name):\n    return name\n# needle in source\n",
+            encoding="utf-8",
+        )
+
+        result = self.workspace.search_code("needle")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            [(match["path"], match["line_number"], match["column"]) for match in result["matches"]],
+            [("docs/guide.md", 1, 1), ("src/app.py", 3, 3)],
+        )
+        self.assertEqual(result["matched_files"], 2)
+        self.assertFalse(result["truncated"])
+        self.assertTrue(result["complete"])
+        self.assertNotIn(str(self.root), json.dumps(result))
+
+    def test_search_code_supports_case_sensitive_literal_search(self) -> None:
+        target = self.root / "literal.txt"
+        target.write_text("Needle needle\nvalue = '.*'\n", encoding="utf-8")
+
+        insensitive = self.workspace.search_code("needle", path="literal.txt")
+        sensitive = self.workspace.search_code(
+            "needle",
+            path="literal.txt",
+            case_sensitive=True,
+        )
+        literal = self.workspace.search_code(".*", path="literal.txt")
+
+        self.assertEqual(insensitive["matches"][0]["column"], 1)
+        self.assertEqual(len(insensitive["matches"]), 1)
+        self.assertEqual(sensitive["matches"][0]["column"], 8)
+        self.assertEqual(len(sensitive["matches"]), 1)
+        self.assertEqual(literal["matches"][0]["line_number"], 2)
+
+    def test_search_code_limits_search_to_requested_path(self) -> None:
+        docs = self.root / "docs"
+        docs.mkdir()
+        (docs / "guide.md").write_text("scope-needle\n", encoding="utf-8")
+        (self.root / "src" / "app.py").write_text("scope-needle\n", encoding="utf-8")
+
+        directory_result = self.workspace.search_code("scope-needle", path="src")
+        file_result = self.workspace.search_code("scope-needle", path="docs/guide.md")
+
+        self.assertEqual(
+            [match["path"] for match in directory_result["matches"]],
+            ["src/app.py"],
+        )
+        self.assertEqual(
+            [match["path"] for match in file_result["matches"]],
+            ["docs/guide.md"],
+        )
+
+    def test_search_code_skips_sensitive_binary_and_large_files(self) -> None:
+        (self.root / ".env").write_text("needle-secret\n", encoding="utf-8")
+        (self.root / "secrets.py").write_text("needle-secret\n", encoding="utf-8")
+        (self.root / ".env.example").write_text("needle-example\n", encoding="utf-8")
+        git_directory = self.root / ".git"
+        git_directory.mkdir()
+        (git_directory / "config").write_text("needle-git\n", encoding="utf-8")
+        uv_cache = self.root / ".uv-cache"
+        uv_cache.mkdir()
+        (uv_cache / "cached.txt").write_text("needle-cache\n", encoding="utf-8")
+        (self.root / "bad.bin").write_bytes(b"\xffneedle-bad")
+        (self.root / "null.bin").write_bytes(b"needle-null\x00")
+        (self.root / "large.txt").write_text(
+            "needle-large" + "x" * 1_000_000,
+            encoding="utf-8",
+        )
+
+        result = self.workspace.search_code("needle")
+        serialized = json.dumps(result, ensure_ascii=False)
+
+        self.assertEqual(
+            [match["path"] for match in result["matches"]],
+            [".env.example"],
+        )
+        self.assertEqual(result["skipped_files"], 3)
+        self.assertFalse(result["truncated"])
+        self.assertFalse(result["complete"])
+        self.assertNotIn("needle-secret", serialized)
+        self.assertNotIn("needle-git", serialized)
+        self.assertNotIn("needle-cache", serialized)
+        self.assertNotIn("needle-bad", serialized)
+        self.assertNotIn("needle-null", serialized)
+        self.assertNotIn("needle-large", serialized)
+
+    def test_search_code_reports_result_truncation_accurately(self) -> None:
+        (self.root / "matches.txt").write_text(
+            "limit-needle one\nlimit-needle two\nlimit-needle three\n",
+            encoding="utf-8",
+        )
+
+        limited = self.workspace.search_code("limit-needle", max_results=2)
+        exact = self.workspace.search_code("limit-needle", max_results=3)
+
+        self.assertEqual(len(limited["matches"]), 2)
+        self.assertTrue(limited["truncated"])
+        self.assertEqual(len(exact["matches"]), 3)
+        self.assertFalse(exact["truncated"])
+
+    def test_search_code_bounds_long_match_content(self) -> None:
+        (self.root / "long.txt").write_text(
+            "x" * 800 + "needle" + "y" * 800 + "\n",
+            encoding="utf-8",
+        )
+
+        result = self.workspace.search_code("needle", path="long.txt")
+        match = result["matches"][0]
+
+        self.assertEqual(match["column"], 801)
+        self.assertTrue(match["content_truncated"])
+        self.assertIn("needle", match["content"])
+        self.assertLessEqual(len(match["content"]), 502)
+
+    def test_search_code_counts_skipped_files_toward_byte_budget(self) -> None:
+        budget_directory = self.root / "budget"
+        budget_directory.mkdir()
+        (budget_directory / "a-bad.bin").write_bytes(b"\xff" * 8)
+        (budget_directory / "b-match.txt").write_text("needle\n", encoding="utf-8")
+
+        with patch.object(SafeWorkspace, "_MAX_SEARCH_BYTES", 10):
+            result = self.workspace.search_code("needle", path="budget")
+
+        self.assertEqual(result["scanned_bytes"], 10)
+        self.assertEqual(result["skipped_files"], 1)
+        self.assertEqual(result["matches"], [])
+        self.assertTrue(result["truncated"])
+        self.assertFalse(result["complete"])
+
+    def test_search_code_limits_serialized_output_size(self) -> None:
+        escaped_content = "needle" + "\x01" * 494
+        (self.root / "escaped.txt").write_text(
+            "\n".join([escaped_content] * 3),
+            encoding="utf-8",
+        )
+
+        with patch.object(SafeWorkspace, "_MAX_SEARCH_OUTPUT_CHARS", 4_000):
+            result = self.workspace.search_code("needle", path="escaped.txt")
+
+        self.assertEqual(len(result["matches"]), 1)
+        self.assertTrue(result["truncated"])
+        self.assertLessEqual(len(json.dumps(result, ensure_ascii=False)), 4_000)
+
+    def test_search_code_limits_directory_traversal_work(self) -> None:
+        traversal_directory = self.root / "traversal"
+        traversal_directory.mkdir()
+        for name in ("a.txt", "b.txt", "c.txt"):
+            (traversal_directory / name).write_text("needle\n", encoding="utf-8")
+
+        with patch.object(SafeWorkspace, "_MAX_SEARCH_ENTRIES", 2):
+            result = self.workspace.search_code("needle", path="traversal")
+
+        self.assertLessEqual(result["scanned_files"], 2)
+        self.assertTrue(result["truncated"])
+        self.assertFalse(result["complete"])
+
+    def test_search_code_limits_candidate_file_count(self) -> None:
+        file_limit_directory = self.root / "file-limit"
+        file_limit_directory.mkdir()
+        for name in ("a.txt", "b.txt"):
+            (file_limit_directory / name).write_text("needle\n", encoding="utf-8")
+
+        with patch.object(SafeWorkspace, "_MAX_SEARCH_FILES", 1):
+            result = self.workspace.search_code("needle", path="file-limit")
+
+        self.assertEqual(result["scanned_files"], 1)
+        self.assertEqual(len(result["matches"]), 1)
+        self.assertTrue(result["truncated"])
+
+    def test_search_code_limits_visited_directory_count(self) -> None:
+        directory_limit_root = self.root / "directory-limit"
+        directory_limit_root.mkdir()
+        for name in ("a", "b"):
+            child = directory_limit_root / name
+            child.mkdir()
+            (child / "match.txt").write_text("needle\n", encoding="utf-8")
+
+        with patch.object(SafeWorkspace, "_MAX_SEARCH_DIRECTORIES", 1):
+            result = self.workspace.search_code("needle", path="directory-limit")
+
+        self.assertEqual(result["scanned_files"], 0)
+        self.assertEqual(result["matches"], [])
+        self.assertTrue(result["truncated"])
+
+    def test_search_code_rejects_invalid_parameters(self) -> None:
+        invalid_queries = [
+            "",
+            "   ",
+            "line one\nline two",
+            "line one\vline two",
+            "nul\x00value",
+            "x" * 201,
+            123,
+        ]
+        for query in invalid_queries:
+            with self.subTest(query=query), self.assertRaises(WorkspaceError):
+                self.workspace.search_code(query)  # type: ignore[arg-type]
+
+        with self.assertRaisesRegex(WorkspaceError, "case_sensitive"):
+            self.workspace.search_code("needle", case_sensitive="yes")  # type: ignore[arg-type]
+
+        for max_results in [0, 101, True, "2"]:
+            with self.subTest(max_results=max_results), self.assertRaises(WorkspaceError):
+                self.workspace.search_code("needle", max_results=max_results)  # type: ignore[arg-type]
+
+        with self.assertRaisesRegex(WorkspaceError, "路径不存在"):
+            self.workspace.search_code("needle", path="missing")
+        with self.assertRaisesRegex(WorkspaceError, "绝对路径"):
+            self.workspace.search_code("needle", path=str(self.root / "README.md"))
+        with self.assertRaisesRegex(WorkspaceError, "超出了"):
+            self.workspace.search_code("needle", path="../outside")
+
+    def test_search_code_is_available_through_registry(self) -> None:
+        registry = build_read_only_registry(self.workspace)
+        call = ToolCall(
+            id="call-search",
+            name="search_code",
+            arguments={"query": "greet", "path": "src"},
+        )
+
+        result = json.loads(registry.execute(call))
+        missing_query = json.loads(
+            registry.execute(ToolCall(id="call-invalid", name="search_code", arguments={}))
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["matches"][0]["path"], "src/app.py")
+        self.assertFalse(missing_query["ok"])
+        self.assertEqual(missing_query["error"]["type"], "invalid_arguments")
+        search_schema = next(
+            schema
+            for schema in registry.schemas()
+            if schema["function"]["name"] == "search_code"
+        )
+        parameters = search_schema["function"]["parameters"]
+        self.assertEqual(parameters["required"], ["query"])
+        self.assertFalse(parameters["additionalProperties"])
+        self.assertEqual(parameters["properties"]["max_results"]["default"], 50)
 
     def test_empty_file_has_an_explicit_zero_line_range(self) -> None:
         (self.root / "empty.txt").write_text("", encoding="utf-8")
@@ -123,6 +368,34 @@ class WorkspaceTests(unittest.TestCase):
 
         self.assertNotIn("external", listed_paths)
         self.assertNotIn("external/secret.txt", listed_paths)
+
+    def test_search_code_does_not_follow_file_symlink_outside_workspace(self) -> None:
+        with TemporaryDirectory() as outside_directory:
+            outside = Path(outside_directory) / "outside.txt"
+            outside.write_text("outside-needle\n", encoding="utf-8")
+            link = self.root / "linked.txt"
+            try:
+                link.symlink_to(outside)
+            except OSError:
+                self.skipTest("当前 Windows 环境不允许创建符号链接")
+
+            result = self.workspace.search_code("outside-needle")
+
+        self.assertEqual(result["matches"], [])
+
+    def test_search_code_does_not_follow_directory_symlink_outside_workspace(self) -> None:
+        with TemporaryDirectory() as outside_directory:
+            outside = Path(outside_directory)
+            (outside / "outside.txt").write_text("outside-needle\n", encoding="utf-8")
+            link = self.root / "linked-directory"
+            try:
+                link.symlink_to(outside, target_is_directory=True)
+            except OSError:
+                self.skipTest("当前 Windows 环境不允许创建符号链接")
+
+            result = self.workspace.search_code("outside-needle")
+
+        self.assertEqual(result["matches"], [])
 
 
 if __name__ == "__main__":

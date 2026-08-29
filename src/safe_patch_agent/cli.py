@@ -30,7 +30,7 @@ class ChineseArgumentParser(argparse.ArgumentParser):
 def build_parser() -> argparse.ArgumentParser:
     parser = ChineseArgumentParser(
         prog="safe-patch-agent",
-        description="运行第一阶段的只读编程 Agent。",
+        description="运行具备代码搜索能力的只读编程 Agent。",
         add_help=False,
     )
     parser._positionals.title = "位置参数"
