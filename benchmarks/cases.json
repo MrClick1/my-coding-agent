@@ -1,0 +1,51 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "id": "read_marker",
+      "description": "读取文件并准确提取项目识别码",
+      "fixture": "fixtures/read_marker",
+      "goal": "请读取 README.md，并告诉我其中的项目识别码。最终回答必须写出完整识别码。",
+      "expected_answer_contains": [
+        "ORBIT-17"
+      ],
+      "required_tools": [
+        "read_file"
+      ]
+    },
+    {
+      "id": "search_symbol",
+      "description": "搜索符号并确认其定义文件",
+      "fixture": "fixtures/search_symbol",
+      "goal": "请使用代码搜索定位 build_release_note 的定义，读取命中文件后说明它位于哪个文件。",
+      "expected_answer_contains": [
+        "build_release_note",
+        "src/release_notes.py"
+      ],
+      "required_tools": [
+        "search_code",
+        "read_file"
+      ]
+    },
+    {
+      "id": "fix_add_bug",
+      "description": "修复一处实现错误并运行固定测试",
+      "fixture": "fixtures/fix_add_bug",
+      "goal": "calculator.py 的 add 实现有错误。请读取并修复实现，不要修改测试；完成后运行测试，并简要报告修改与测试结果。",
+      "expected_answer_contains": [
+        "calculator.py",
+        "测试"
+      ],
+      "required_tools": [
+        "read_file",
+        "replace_text",
+        "run_tests"
+      ],
+      "expected_files": {
+        "calculator.py": "def add(left: int, right: int) -> int:\n    \"\"\"返回两个整数的和。\"\"\"\n\n    return left + right\n"
+      },
+      "require_tests_run": true,
+      "require_tests_passed": true
+    }
+  ]
+}

@@ -18,6 +18,7 @@ dev = [
 
 [project.scripts]
 safe-patch-agent = "safe_patch_agent.cli:main"
+safe-patch-benchmark = "safe_patch_agent.benchmark:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -29,3 +30,6 @@ extend-exclude = [".uv-cache"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
