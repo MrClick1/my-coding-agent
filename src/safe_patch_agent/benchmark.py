@@ -224,7 +224,12 @@ class BenchmarkRunner:
             workspace_root = Path(temporary_directory) / "workspace"
             shutil.copytree(case.fixture, workspace_root)
             registry = _RecordingRegistry(
-                build_agent_registry(SafeWorkspace(workspace_root))
+                build_agent_registry(
+                    SafeWorkspace(
+                        workspace_root,
+                        replacement_approval=lambda _preview: True,
+                    )
+                )
             )
             client = _RecordingClient(self.client_factory(case))
             result: AgentResult | None = None

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import difflib
 import json
 import os
 import re
@@ -10,6 +11,8 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +21,20 @@ from safe_patch_agent.tooling import ToolDefinition, ToolFileAccess, ToolRegistr
 
 class WorkspaceError(ValueError):
     """请求的路径或操作不安全或无效。"""
+
+
+@dataclass(frozen=True)
+class ReplacementPreview:
+    """等待用户确认的一次精确替换预览。"""
+
+    path: str
+    diff: str
+    replacements: int
+    original_bytes: int
+    updated_bytes: int
+
+
+ReplacementApproval = Callable[[ReplacementPreview], bool]
 
 
 class SafeWorkspace:
@@ -34,6 +51,7 @@ class SafeWorkspace:
     _MAX_SEARCH_LINE_CHARS = 500
     _MAX_SEARCH_OUTPUT_CHARS = 35_000
     _MAX_REPLACEMENTS = 100
+    _MAX_PATCH_PREVIEW_CHARS = 30_000
     _TEST_TIMEOUT_SECONDS = 120
     _MAX_TEST_OUTPUT_CHARS = 40_000
     _SENSITIVE_ENV_MARKERS = (
@@ -87,13 +105,21 @@ class SafeWorkspace:
     }
     _SENSITIVE_FILE_SUFFIXES = {".jks", ".key", ".keystore", ".p12", ".pem", ".pfx"}
 
-    def __init__(self, root: Path) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        replacement_approval: ReplacementApproval | None = None,
+    ) -> None:
         resolved_root = root.expanduser().resolve()
         if not resolved_root.exists():
             raise WorkspaceError(f"工作区不存在：{resolved_root}")
         if not resolved_root.is_dir():
             raise WorkspaceError(f"工作区路径不是目录：{resolved_root}")
+        if replacement_approval is not None and not callable(replacement_approval):
+            raise WorkspaceError("replacement_approval 必须是可调用对象")
         self.root = resolved_root
+        self.replacement_approval = replacement_approval
 
     def resolve(self, relative_path: str, *, must_exist: bool = True) -> Path:
         """解析相对路径，并确保解析结果仍位于工作区内。"""
@@ -388,7 +414,7 @@ class SafeWorkspace:
         new_text: str,
         expected_replacements: int = 1,
     ) -> dict[str, Any]:
-        """精确校验出现次数后，以原子方式替换 UTF-8 文件中的字面量。"""
+        """生成完整差异并获得用户确认后，原子替换 UTF-8 文件。"""
 
         if not isinstance(old_text, str) or not old_text:
             raise WorkspaceError("old_text 必须是非空字符串")
@@ -433,14 +459,61 @@ class SafeWorkspace:
                 f"替换后的文件超过 {self._MAX_FILE_BYTES} 字节上限；文件未修改"
             )
 
+        diff = self._replacement_diff(display_path, original_text, updated_text)
+        if len(diff) > self._MAX_PATCH_PREVIEW_CHARS:
+            raise WorkspaceError(
+                "修改预览超过 "
+                f"{self._MAX_PATCH_PREVIEW_CHARS} 字符上限，无法完整展示；文件未修改"
+            )
+        preview = ReplacementPreview(
+            path=display_path,
+            diff=diff,
+            replacements=actual_replacements,
+            original_bytes=original_bytes,
+            updated_bytes=len(updated_bytes),
+        )
+        if self.replacement_approval is None:
+            raise WorkspaceError("未配置用户确认，拒绝修改文件")
+        try:
+            approved = self.replacement_approval(preview)
+        except Exception as exc:
+            raise WorkspaceError("无法获得用户确认；文件未修改") from exc
+        if approved is not True:
+            raise WorkspaceError("用户拒绝了修改；文件未修改")
+
+        current_text, current_bytes = self._read_utf8_text(target, display_path)
+        if current_bytes != original_bytes or current_text != original_text:
+            raise WorkspaceError("文件在确认期间发生变化；为避免覆盖新内容，已取消修改")
+
         self._atomic_write(target, updated_bytes)
         return {
             "ok": True,
             "path": display_path,
+            "approved": True,
+            "diff": diff,
             "replacements": actual_replacements,
             "original_bytes": original_bytes,
             "updated_bytes": len(updated_bytes),
         }
+
+    @staticmethod
+    def _replacement_diff(path: str, original_text: str, updated_text: str) -> str:
+        """创建适合终端完整展示的 unified diff。"""
+
+        raw_lines = difflib.unified_diff(
+            original_text.splitlines(keepends=True),
+            updated_text.splitlines(keepends=True),
+            fromfile=f"a/{path}",
+            tofile=f"b/{path}",
+            lineterm="\n",
+        )
+        visible_lines: list[str] = []
+        for line in raw_lines:
+            has_newline = line.endswith("\n")
+            visible_lines.append(line.replace("\r\n", "␍\n").replace("\r", "␍"))
+            if not has_newline:
+                visible_lines.append("\n\\ 文件末尾无换行符\n")
+        return "".join(visible_lines)
 
     def run_tests(self) -> dict[str, Any]:
         """在工作区运行参数固定、时间和输出受限的 pytest。"""
@@ -842,8 +915,8 @@ def build_agent_registry(workspace: SafeWorkspace) -> ToolRegistry:
         ToolDefinition(
             name="replace_text",
             description=(
-                "精确替换已读取 UTF-8 文件中的字面量。实际出现次数必须与"
-                " expected_replacements 完全一致，否则不会修改文件。"
+                "精确替换已读取 UTF-8 文件中的字面量。写入前会向用户展示完整"
+                " diff 并要求确认；实际出现次数必须与 expected_replacements 完全一致。"
             ),
             parameters={
                 "type": "object",

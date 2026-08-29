@@ -6,7 +6,13 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from safe_patch_agent.cli import build_parser, main
+from safe_patch_agent.cli import build_parser, main, request_replacement_approval
+from safe_patch_agent.workspace import ReplacementPreview
+
+
+class InteractiveStringIO(StringIO):
+    def isatty(self) -> bool:
+        return True
 
 
 class CLITests(unittest.TestCase):
@@ -36,6 +42,53 @@ class CLITests(unittest.TestCase):
         self.assertEqual(exit_code, 1)
         self.assertIn("缺少必需配置", stderr.getvalue())
         self.assertNotIn("Traceback", stderr.getvalue())
+
+    def test_replacement_approval_shows_diff_and_accepts_explicit_yes(self) -> None:
+        preview = ReplacementPreview(
+            path="src/app.py",
+            diff="--- a/src/app.py\n+++ b/src/app.py\n-old\n+new\n",
+            replacements=1,
+            original_bytes=4,
+            updated_bytes=4,
+        )
+        output = StringIO()
+
+        approved = request_replacement_approval(
+            preview,
+            input_stream=InteractiveStringIO("是\n"),
+            output_stream=output,
+        )
+
+        self.assertTrue(approved)
+        self.assertIn("SafePatch 修改预览", output.getvalue())
+        self.assertIn("src/app.py", output.getvalue())
+        self.assertIn("-old\n+new", output.getvalue())
+
+    def test_replacement_approval_defaults_to_rejection(self) -> None:
+        preview = ReplacementPreview("demo.py", "diff\n", 1, 3, 3)
+        output = StringIO()
+
+        approved = request_replacement_approval(
+            preview,
+            input_stream=InteractiveStringIO("\n"),
+            output_stream=output,
+        )
+
+        self.assertFalse(approved)
+        self.assertIn("已取消", output.getvalue())
+
+    def test_non_interactive_input_cannot_approve_replacement(self) -> None:
+        preview = ReplacementPreview("demo.py", "diff\n", 1, 3, 3)
+        output = StringIO()
+
+        approved = request_replacement_approval(
+            preview,
+            input_stream=StringIO("yes\n"),
+            output_stream=output,
+        )
+
+        self.assertFalse(approved)
+        self.assertIn("不是交互式终端", output.getvalue())
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from safe_patch_agent.messages import ToolCall
 from safe_patch_agent.workspace import (
+    ReplacementPreview,
     SafeWorkspace,
     WorkspaceError,
     build_agent_registry,
@@ -26,7 +27,10 @@ class WorkspaceTests(unittest.TestCase):
             encoding="utf-8",
         )
         (self.root / "README.md").write_text("# Demo\n", encoding="utf-8")
-        self.workspace = SafeWorkspace(self.root)
+        self.workspace = SafeWorkspace(
+            self.root,
+            replacement_approval=lambda _preview: True,
+        )
 
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
@@ -305,6 +309,102 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(target.read_text(encoding="utf-8"), "new = 2\nnew = 2\n")
         self.assertEqual(result["replacements"], 2)
         self.assertEqual(result["path"], "replace.py")
+        self.assertTrue(result["approved"])
+        self.assertIn("--- a/replace.py", result["diff"])
+        self.assertIn("+++ b/replace.py", result["diff"])
+
+    def test_replace_text_sends_complete_diff_to_approval_callback(self) -> None:
+        target = self.root / "replace.py"
+        target.write_text("old\n", encoding="utf-8")
+        previews: list[ReplacementPreview] = []
+
+        def approve(preview: ReplacementPreview) -> bool:
+            previews.append(preview)
+            return True
+
+        workspace = SafeWorkspace(
+            self.root,
+            replacement_approval=approve,
+        )
+
+        workspace.replace_text("replace.py", "old", "new")
+
+        self.assertEqual(target.read_text(encoding="utf-8"), "new\n")
+        self.assertEqual(len(previews), 1)
+        self.assertEqual(previews[0].path, "replace.py")
+        self.assertEqual(previews[0].replacements, 1)
+        self.assertIn("-old", previews[0].diff)
+        self.assertIn("+new", previews[0].diff)
+
+    def test_replace_text_is_denied_without_approval_callback(self) -> None:
+        target = self.root / "replace.py"
+        target.write_text("old\n", encoding="utf-8")
+        workspace = SafeWorkspace(self.root)
+
+        with self.assertRaisesRegex(WorkspaceError, "未配置用户确认"):
+            workspace.replace_text("replace.py", "old", "new")
+
+        self.assertEqual(target.read_text(encoding="utf-8"), "old\n")
+
+    def test_workspace_rejects_non_callable_approval_handler(self) -> None:
+        with self.assertRaisesRegex(WorkspaceError, "必须是可调用对象"):
+            SafeWorkspace(self.root, replacement_approval=True)  # type: ignore[arg-type]
+
+    def test_replace_text_honors_rejection(self) -> None:
+        target = self.root / "replace.py"
+        target.write_text("old\n", encoding="utf-8")
+        workspace = SafeWorkspace(
+            self.root,
+            replacement_approval=lambda _preview: False,
+        )
+
+        with self.assertRaisesRegex(WorkspaceError, "用户拒绝"):
+            workspace.replace_text("replace.py", "old", "new")
+
+        self.assertEqual(target.read_text(encoding="utf-8"), "old\n")
+
+    def test_replace_text_rejects_file_changed_during_approval(self) -> None:
+        target = self.root / "replace.py"
+        target.write_text("old\n", encoding="utf-8")
+
+        def change_file_during_approval(_preview: ReplacementPreview) -> bool:
+            target.write_text("concurrent change\n", encoding="utf-8")
+            return True
+
+        workspace = SafeWorkspace(
+            self.root,
+            replacement_approval=change_file_during_approval,
+        )
+
+        with self.assertRaisesRegex(WorkspaceError, "确认期间发生变化"):
+            workspace.replace_text("replace.py", "old", "new")
+
+        self.assertEqual(target.read_text(encoding="utf-8"), "concurrent change\n")
+
+    def test_replace_text_rejects_preview_that_cannot_be_shown_completely(self) -> None:
+        target = self.root / "replace.py"
+        target.write_text("old\n", encoding="utf-8")
+        approval_called = False
+
+        def approve(_preview: ReplacementPreview) -> bool:
+            nonlocal approval_called
+            approval_called = True
+            return True
+
+        workspace = SafeWorkspace(self.root, replacement_approval=approve)
+        with (
+            patch.object(SafeWorkspace, "_MAX_PATCH_PREVIEW_CHARS", 10),
+            self.assertRaisesRegex(WorkspaceError, "无法完整展示"),
+        ):
+            workspace.replace_text("replace.py", "old", "new")
+
+        self.assertFalse(approval_called)
+        self.assertEqual(target.read_text(encoding="utf-8"), "old\n")
+
+    def test_replacement_diff_marks_missing_final_newline(self) -> None:
+        diff = SafeWorkspace._replacement_diff("demo.txt", "old\n", "old")
+
+        self.assertIn("文件末尾无换行符", diff)
 
     def test_replace_text_mismatch_leaves_file_unchanged(self) -> None:
         target = self.root / "replace.py"

@@ -45,12 +45,19 @@ class CountingRegistry(ToolRegistry):
         return '{"ok":true}'
 
 
+def build_approved_registry(root: Path) -> ToolRegistry:
+    """为离线 Agent 测试显式批准临时工作区中的替换。"""
+
+    workspace = SafeWorkspace(root, replacement_approval=lambda _preview: True)
+    return build_agent_registry(workspace)
+
+
 class AgentTests(unittest.TestCase):
     def test_tool_result_is_sent_back_before_final_answer(self) -> None:
         with TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             (root / "README.md").write_text("# Demo\n", encoding="utf-8")
-            registry = build_agent_registry(SafeWorkspace(root))
+            registry = build_approved_registry(root)
             call = ToolCall(id="call-1", name="list_files", arguments={"path": "."})
             client = ScriptedClient(
                 [
@@ -116,7 +123,7 @@ class AgentTests(unittest.TestCase):
         with TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             (root / "README.md").write_text("# Demo\n", encoding="utf-8")
-            registry = build_agent_registry(SafeWorkspace(root))
+            registry = build_approved_registry(root)
             read_call = ToolCall(
                 id="read",
                 name="read_file",
@@ -143,7 +150,7 @@ class AgentTests(unittest.TestCase):
             root = Path(temporary_directory)
             target = root / "demo.py"
             target.write_text("value = 1\n", encoding="utf-8")
-            registry = build_agent_registry(SafeWorkspace(root))
+            registry = build_approved_registry(root)
             read_call = ToolCall(
                 id="read",
                 name="read_file",
@@ -185,12 +192,58 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(result.state.read_files, ("demo.py",))
         self.assertEqual(result.state.modified_files, ("demo.py",))
 
+    def test_agent_can_report_a_user_rejected_modification(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            target = root / "demo.py"
+            target.write_text("value = 1\n", encoding="utf-8")
+            workspace = SafeWorkspace(
+                root,
+                replacement_approval=lambda _preview: False,
+            )
+            registry = build_agent_registry(workspace)
+            read_call = ToolCall(
+                id="read",
+                name="read_file",
+                arguments={"path": "demo.py"},
+            )
+            replace_call = ToolCall(
+                id="replace",
+                name="replace_text",
+                arguments={
+                    "path": "demo.py",
+                    "old_text": "value = 1",
+                    "new_text": "value = 2",
+                },
+            )
+            client = ScriptedClient(
+                [
+                    ChatCompletion(ChatMessage.assistant(None, (read_call,)), "tool_calls"),
+                    ChatCompletion(
+                        ChatMessage.assistant(None, (replace_call,)),
+                        "tool_calls",
+                    ),
+                    ChatCompletion(ChatMessage.assistant("用户拒绝了修改。"), "stop"),
+                ]
+            )
+
+            result = CodingAgent(client, registry).run("把 value 改为 2")
+            updated_content = target.read_text(encoding="utf-8")
+
+        self.assertEqual(updated_content, "value = 1\n")
+        self.assertEqual(result.answer, "用户拒绝了修改。")
+        self.assertEqual(result.state.modified_files, ())
+        self.assertEqual(result.state.test_runs, 0)
+        tool_result = json.loads(client.requests[2][0][-1].content)
+        self.assertFalse(tool_result["ok"])
+        self.assertIn("用户拒绝", tool_result["error"]["message"])
+
     def test_agent_requires_test_run_after_latest_modification(self) -> None:
         with TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             target = root / "demo.py"
             target.write_text("value = 1\n", encoding="utf-8")
-            registry = build_agent_registry(SafeWorkspace(root))
+            registry = build_approved_registry(root)
             calls = [
                 ToolCall(id="read", name="read_file", arguments={"path": "demo.py"}),
                 ToolCall(
@@ -232,7 +285,7 @@ class AgentTests(unittest.TestCase):
         with TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             (root / "demo.py").write_text("old\n", encoding="utf-8")
-            registry = build_agent_registry(SafeWorkspace(root))
+            registry = build_approved_registry(root)
             read_call = ToolCall(
                 id="read",
                 name="read_file",
