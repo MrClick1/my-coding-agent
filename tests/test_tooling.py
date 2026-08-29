@@ -154,6 +154,50 @@ class ToolingTests(unittest.TestCase):
                 file_access=ToolFileAccess.READ,
             )
 
+    def test_test_runner_updates_verification_state(self) -> None:
+        registry = ToolRegistry()
+        registry.state.mark_file_read("demo.py")
+        registry.state.mark_file_modified("demo.py")
+        registry.register(
+            ToolDefinition(
+                "run_tests",
+                "测试",
+                {"type": "object"},
+                lambda: {"ok": True, "passed": False},
+                records_test_result=True,
+            )
+        )
+
+        result = json.loads(
+            registry.execute(ToolCall(id="tests", name="run_tests", arguments={}))
+        )
+
+        self.assertTrue(result["ok"])
+        snapshot = registry.state.snapshot()
+        self.assertEqual(snapshot.test_runs, 1)
+        self.assertFalse(snapshot.last_test_passed)
+        self.assertFalse(snapshot.has_unverified_changes)
+
+    def test_test_runner_must_return_boolean_passed_field(self) -> None:
+        registry = ToolRegistry()
+        registry.register(
+            ToolDefinition(
+                "run_tests",
+                "测试",
+                {"type": "object"},
+                lambda: {"ok": True, "passed": "yes"},
+                records_test_result=True,
+            )
+        )
+
+        result = json.loads(
+            registry.execute(ToolCall(id="tests", name="run_tests", arguments={}))
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"]["type"], "tool_error")
+        self.assertEqual(registry.state.snapshot().test_runs, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

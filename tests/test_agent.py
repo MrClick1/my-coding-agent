@@ -4,8 +4,14 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
+from unittest.mock import patch
 
-from safe_patch_agent.agent import AgentLoopLimitError, AgentToolLimitError, CodingAgent
+from safe_patch_agent.agent import (
+    AgentLoopLimitError,
+    AgentToolLimitError,
+    AgentVerificationError,
+    CodingAgent,
+)
 from safe_patch_agent.llm_client import ChatCompletion
 from safe_patch_agent.messages import ChatMessage, ToolCall
 from safe_patch_agent.tooling import ToolRegistry
@@ -65,7 +71,7 @@ class AgentTests(unittest.TestCase):
         self.assertTrue(json.loads(tool_message.content)["ok"])
         self.assertEqual(
             {tool["function"]["name"] for tool in client.requests[0][1]},
-            {"list_files", "read_file", "replace_text", "search_code"},
+            {"list_files", "read_file", "replace_text", "run_tests", "search_code"},
         )
 
     def test_loop_limit_stops_repeated_tool_calls(self) -> None:
@@ -152,6 +158,7 @@ class AgentTests(unittest.TestCase):
                     "new_text": "value = 2",
                 },
             )
+            test_call = ToolCall(id="tests", name="run_tests", arguments={})
             client = ScriptedClient(
                 [
                     ChatCompletion(ChatMessage.assistant(None, (read_call,)), "tool_calls"),
@@ -159,17 +166,93 @@ class AgentTests(unittest.TestCase):
                         ChatMessage.assistant(None, (replace_call,)),
                         "tool_calls",
                     ),
+                    ChatCompletion(
+                        ChatMessage.assistant(None, (test_call,)),
+                        "tool_calls",
+                    ),
                     ChatCompletion(ChatMessage.assistant("修改完成。"), "stop"),
                 ]
             )
 
-            result = CodingAgent(client, registry).run("把 value 改为 2")
+            with patch("safe_patch_agent.workspace.subprocess.run") as run:
+                run.return_value.returncode = 0
+                run.return_value.stdout = "1 passed\n"
+                result = CodingAgent(client, registry).run("把 value 改为 2")
             updated_content = target.read_text(encoding="utf-8")
 
         self.assertEqual(updated_content, "value = 2\n")
-        self.assertEqual(result.tool_calls, 2)
+        self.assertEqual(result.tool_calls, 3)
         self.assertEqual(result.state.read_files, ("demo.py",))
         self.assertEqual(result.state.modified_files, ("demo.py",))
+
+    def test_agent_requires_test_run_after_latest_modification(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            target = root / "demo.py"
+            target.write_text("value = 1\n", encoding="utf-8")
+            registry = build_agent_registry(SafeWorkspace(root))
+            calls = [
+                ToolCall(id="read", name="read_file", arguments={"path": "demo.py"}),
+                ToolCall(
+                    id="replace",
+                    name="replace_text",
+                    arguments={
+                        "path": "demo.py",
+                        "old_text": "value = 1",
+                        "new_text": "value = 2",
+                    },
+                ),
+                ToolCall(id="tests", name="run_tests", arguments={}),
+            ]
+            client = ScriptedClient(
+                [
+                    ChatCompletion(ChatMessage.assistant(None, (calls[0],)), "tool_calls"),
+                    ChatCompletion(ChatMessage.assistant(None, (calls[1],)), "tool_calls"),
+                    ChatCompletion(ChatMessage.assistant("修改完成。"), "stop"),
+                    ChatCompletion(ChatMessage.assistant(None, (calls[2],)), "tool_calls"),
+                    ChatCompletion(ChatMessage.assistant("修改并验证完成。"), "stop"),
+                ]
+            )
+
+            with patch("safe_patch_agent.workspace.subprocess.run") as run:
+                run.return_value.returncode = 0
+                run.return_value.stdout = "1 passed\n"
+                result = CodingAgent(client, registry).run("修改并测试")
+
+        self.assertEqual(result.answer, "修改并验证完成。")
+        self.assertEqual(result.model_rounds, 5)
+        self.assertEqual(result.state.test_runs, 1)
+        self.assertTrue(result.state.last_test_passed)
+        self.assertFalse(result.state.has_unverified_changes)
+        reminder = client.requests[3][0][-1]
+        self.assertEqual(reminder.role.value, "system")
+        self.assertIn("必须调用 run_tests", reminder.content)
+
+    def test_agent_errors_when_round_limit_prevents_required_test(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "demo.py").write_text("old\n", encoding="utf-8")
+            registry = build_agent_registry(SafeWorkspace(root))
+            read_call = ToolCall(
+                id="read",
+                name="read_file",
+                arguments={"path": "demo.py"},
+            )
+            replace_call = ToolCall(
+                id="replace",
+                name="replace_text",
+                arguments={"path": "demo.py", "old_text": "old", "new_text": "new"},
+            )
+            client = ScriptedClient(
+                [
+                    ChatCompletion(ChatMessage.assistant(None, (read_call,)), "tool_calls"),
+                    ChatCompletion(ChatMessage.assistant(None, (replace_call,)), "tool_calls"),
+                    ChatCompletion(ChatMessage.assistant("修改完成。"), "stop"),
+                ]
+            )
+
+            with self.assertRaisesRegex(AgentVerificationError, "没有运行测试"):
+                CodingAgent(client, registry, max_rounds=3).run("修改")
 
 
 if __name__ == "__main__":

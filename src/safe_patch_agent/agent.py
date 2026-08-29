@@ -14,12 +14,16 @@ SYSTEM_PROMPT = """你是 SafePatch Agent，一个具备受控精确修改能力
 工作区工具是你了解项目内容的唯一可靠来源。当任务依赖项目内容时，必须先检查工作区再回答。
 所有路径都必须是相对于已配置工作区的相对路径。如果工具返回错误，请修正调用参数，或者明确
 说明当前限制。修改文件前必须先使用 read_file 读取目标文件，再使用 replace_text 做精确替换。
-不得声称自己创建、删除、测试或执行了项目文件；当前没有这些能力。
+每次成功修改后必须调用 run_tests；即使测试失败，也要根据真实结果说明。不得声称自己创建、
+删除或执行了其他任意命令；当前没有这些能力。
 
 需要定位符号、定义或引用时，优先使用 search_code 搜索，再使用 read_file 阅读命中位置的上下文。
 
 请根据你实际检查过的文件，给出简洁、准确的最终回答。
 """
+
+VERIFICATION_REMINDER = """你已经修改了文件，但尚未调用 run_tests 验证最新修改。
+在给出最终回答前必须调用 run_tests；不要仅用文字声称测试已经运行。"""
 
 
 class AgentError(RuntimeError):
@@ -32,6 +36,10 @@ class AgentLoopLimitError(AgentError):
 
 class AgentToolLimitError(AgentError):
     """模型请求的工具调用总数超过上限。"""
+
+
+class AgentVerificationError(AgentError):
+    """Agent 在模型轮次耗尽前没有验证最新修改。"""
 
 
 @dataclass(frozen=True)
@@ -90,6 +98,13 @@ class CodingAgent:
                 answer = (assistant_message.content or "").strip()
                 if not answer:
                     raise AgentError("模型既没有返回工具调用，也没有给出最终答案")
+                if self.registry.state.has_unverified_changes:
+                    if round_number >= self.max_rounds:
+                        raise AgentVerificationError(
+                            "Agent 修改了文件，但在模型调用上限内没有运行测试"
+                        )
+                    messages.append(ChatMessage.system(VERIFICATION_REMINDER))
+                    continue
                 return AgentResult(
                     answer=answer,
                     model_rounds=round_number,

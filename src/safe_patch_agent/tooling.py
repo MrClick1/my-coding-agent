@@ -38,6 +38,7 @@ class ToolDefinition:
     file_access: ToolFileAccess | None = None
     path_argument: str | None = None
     path_normalizer: PathNormalizer | None = None
+    records_test_result: bool = False
 
     def __post_init__(self) -> None:
         if not self.name:
@@ -65,6 +66,10 @@ class ToolDefinition:
             )
         if self.path_normalizer is not None and not callable(self.path_normalizer):
             raise ToolRegistrationError(f"工具 {self.name!r} 的 path_normalizer 必须可调用")
+        if not isinstance(self.records_test_result, bool):
+            raise ToolRegistrationError(
+                f"工具 {self.name!r} 的 records_test_result 必须是布尔值"
+            )
 
     def to_api_dict(self) -> dict[str, Any]:
         return {
@@ -139,6 +144,7 @@ class ToolRegistry:
                 payload = {"ok": True, "result": result}
             if payload.get("ok", True):
                 self._record_file_access(definition, accessed_path, payload)
+                self._record_test_result(definition, payload)
         except ValueError as exc:
             return _json_result(
                 {
@@ -201,6 +207,20 @@ class ToolRegistry:
             self.state.mark_file_read(result_path)
         elif definition.file_access is ToolFileAccess.WRITE:
             self.state.mark_file_modified(result_path)
+
+    def _record_test_result(
+        self,
+        definition: ToolDefinition,
+        payload: Mapping[str, Any],
+    ) -> None:
+        """记录固定测试工具报告的通过或失败状态。"""
+
+        if not definition.records_test_result:
+            return
+        passed = payload.get("passed")
+        if not isinstance(passed, bool):
+            raise ValueError("测试工具必须返回布尔类型的 passed 字段")
+        self.state.record_test_result(passed)
 
 
 def _json_result(value: Any) -> str:

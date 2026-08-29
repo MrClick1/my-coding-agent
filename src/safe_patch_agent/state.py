@@ -18,6 +18,9 @@ class AgentStateSnapshot:
     read_files: tuple[str, ...]
     modified_files: tuple[str, ...]
     blocked_write_attempts: int
+    test_runs: int
+    last_test_passed: bool | None
+    has_unverified_changes: bool
 
 
 @dataclass
@@ -27,6 +30,9 @@ class AgentState:
     _read_files: dict[str, str] = field(default_factory=dict, init=False, repr=False)
     _modified_files: dict[str, str] = field(default_factory=dict, init=False, repr=False)
     blocked_write_attempts: int = field(default=0, init=False)
+    test_runs: int = field(default=0, init=False)
+    last_test_passed: bool | None = field(default=None, init=False)
+    has_unverified_changes: bool = field(default=False, init=False)
 
     def reset(self) -> None:
         """开始新任务前清空上一任务的状态。"""
@@ -34,6 +40,9 @@ class AgentState:
         self._read_files.clear()
         self._modified_files.clear()
         self.blocked_write_attempts = 0
+        self.test_runs = 0
+        self.last_test_passed = None
+        self.has_unverified_changes = False
 
     def mark_file_read(self, path: str) -> None:
         """记录已成功读取完整或指定范围的文件。"""
@@ -56,6 +65,16 @@ class AgentState:
 
         normalized = _normalize_relative_path(path)
         self._modified_files[_path_key(normalized)] = normalized
+        self.has_unverified_changes = True
+
+    def record_test_result(self, passed: bool) -> None:
+        """记录一次固定测试运行，并验证最近一批修改已经接受检查。"""
+
+        if not isinstance(passed, bool):
+            raise AgentStateError("测试结果 passed 必须是布尔值")
+        self.test_runs += 1
+        self.last_test_passed = passed
+        self.has_unverified_changes = False
 
     def snapshot(self) -> AgentStateSnapshot:
         """返回稳定排序的不可变状态。"""
@@ -64,6 +83,9 @@ class AgentState:
             read_files=tuple(sorted(self._read_files.values(), key=str.casefold)),
             modified_files=tuple(sorted(self._modified_files.values(), key=str.casefold)),
             blocked_write_attempts=self.blocked_write_attempts,
+            test_runs=self.test_runs,
+            last_test_passed=self.last_test_passed,
+            has_unverified_changes=self.has_unverified_changes,
         )
 
 

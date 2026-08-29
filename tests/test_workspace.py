@@ -1,4 +1,7 @@
 import json
+import os
+import subprocess
+import sys
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -455,7 +458,7 @@ class WorkspaceTests(unittest.TestCase):
 
         self.assertEqual(
             tool_names,
-            {"list_files", "read_file", "search_code", "replace_text"},
+            {"list_files", "read_file", "search_code", "replace_text", "run_tests"},
         )
         self.assertEqual(
             replace_schema["required"],
@@ -465,6 +468,87 @@ class WorkspaceTests(unittest.TestCase):
             replace_schema["properties"]["expected_replacements"]["default"],
             1,
         )
+
+    def test_run_tests_uses_fixed_command_and_sanitized_environment(self) -> None:
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "LLM_API_KEY": "secret",
+                    "GITHUB_TOKEN": "secret",
+                    "SAFE_TEST_VALUE": "visible",
+                    "PYTEST_ADDOPTS": "--dangerous-option",
+                },
+                clear=False,
+            ),
+            patch("safe_patch_agent.workspace.subprocess.run") as run,
+        ):
+            run.return_value = subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout="2 passed\n",
+            )
+
+            result = self.workspace.run_tests()
+
+        command = run.call_args.args[0]
+        options = run.call_args.kwargs
+        self.assertEqual(command, [sys.executable, "-m", "pytest", "-q"])
+        self.assertEqual(options["cwd"], self.root.resolve())
+        self.assertFalse(options["shell"])
+        self.assertEqual(options["timeout"], SafeWorkspace._TEST_TIMEOUT_SECONDS)
+        self.assertNotIn("LLM_API_KEY", options["env"])
+        self.assertNotIn("GITHUB_TOKEN", options["env"])
+        self.assertNotIn("PYTEST_ADDOPTS", options["env"])
+        self.assertEqual(options["env"]["SAFE_TEST_VALUE"], "visible")
+        self.assertEqual(options["env"]["PYTEST_DISABLE_PLUGIN_AUTOLOAD"], "1")
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["exit_code"], 0)
+        self.assertEqual(result["command"], "python -m pytest -q")
+
+    def test_run_tests_reports_failure_and_updates_registry_state(self) -> None:
+        registry = build_agent_registry(self.workspace)
+        registry.state.mark_file_read("src/app.py")
+        registry.state.mark_file_modified("src/app.py")
+        with patch("safe_patch_agent.workspace.subprocess.run") as run:
+            run.return_value = subprocess.CompletedProcess(
+                args=[],
+                returncode=1,
+                stdout="1 failed\n",
+            )
+            result = json.loads(
+                registry.execute(ToolCall(id="tests", name="run_tests", arguments={}))
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["exit_code"], 1)
+        self.assertEqual(result["output"], "1 failed\n")
+        snapshot = registry.state.snapshot()
+        self.assertEqual(snapshot.test_runs, 1)
+        self.assertFalse(snapshot.last_test_passed)
+        self.assertFalse(snapshot.has_unverified_changes)
+
+    def test_run_tests_reports_timeout_with_bounded_output(self) -> None:
+        long_output = b"start\n" + b"x" * 500
+        with (
+            patch.object(SafeWorkspace, "_MAX_TEST_OUTPUT_CHARS", 100),
+            patch("safe_patch_agent.workspace.subprocess.run") as run,
+        ):
+            run.side_effect = subprocess.TimeoutExpired(
+                cmd=[sys.executable, "-m", "pytest", "-q"],
+                timeout=SafeWorkspace._TEST_TIMEOUT_SECONDS,
+                output=long_output,
+            )
+
+            result = self.workspace.run_tests()
+
+        self.assertFalse(result["passed"])
+        self.assertTrue(result["timed_out"])
+        self.assertIsNone(result["exit_code"])
+        self.assertTrue(result["output_truncated"])
+        self.assertLessEqual(len(result["output"]), 100)
+        self.assertIn("测试输出已截断", result["output"])
 
     def test_empty_file_has_an_explicit_zero_line_range(self) -> None:
         (self.root / "empty.txt").write_text("", encoding="utf-8")

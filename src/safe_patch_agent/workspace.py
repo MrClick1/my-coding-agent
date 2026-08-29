@@ -1,4 +1,4 @@
-"""工作区边界检查，以及目录、搜索、读取和精确替换工具。"""
+"""工作区边界检查，以及目录、搜索、读取、精确替换和固定测试工具。"""
 
 from __future__ import annotations
 
@@ -6,7 +6,10 @@ import json
 import os
 import re
 import stat
+import subprocess
+import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +34,19 @@ class SafeWorkspace:
     _MAX_SEARCH_LINE_CHARS = 500
     _MAX_SEARCH_OUTPUT_CHARS = 35_000
     _MAX_REPLACEMENTS = 100
+    _TEST_TIMEOUT_SECONDS = 120
+    _MAX_TEST_OUTPUT_CHARS = 40_000
+    _SENSITIVE_ENV_MARKERS = (
+        "ACCESS_KEY",
+        "API_KEY",
+        "AUTH",
+        "CREDENTIAL",
+        "PASSWD",
+        "PASSWORD",
+        "PRIVATE_KEY",
+        "SECRET",
+        "TOKEN",
+    )
 
     _IGNORED_DIRECTORY_NAMES = {
         ".git",
@@ -426,6 +442,56 @@ class SafeWorkspace:
             "updated_bytes": len(updated_bytes),
         }
 
+    def run_tests(self) -> dict[str, Any]:
+        """在工作区运行参数固定、时间和输出受限的 pytest。"""
+
+        command = [sys.executable, "-m", "pytest", "-q"]
+        started_at = time.monotonic()
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=self.root,
+                env=self._sanitized_test_environment(),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                shell=False,
+                check=False,
+                timeout=self._TEST_TIMEOUT_SECONDS,
+                encoding="utf-8",
+                errors="replace",
+            )
+        except subprocess.TimeoutExpired as exc:
+            output, output_truncated = self._truncate_test_output(
+                self._decode_test_output(exc.stdout)
+            )
+            return {
+                "ok": True,
+                "passed": False,
+                "command": "python -m pytest -q",
+                "exit_code": None,
+                "timed_out": True,
+                "timeout_seconds": self._TEST_TIMEOUT_SECONDS,
+                "duration_seconds": round(time.monotonic() - started_at, 3),
+                "output": output,
+                "output_truncated": output_truncated,
+            }
+        except OSError as exc:
+            raise WorkspaceError("无法启动固定的 pytest 测试命令") from exc
+
+        output, output_truncated = self._truncate_test_output(completed.stdout or "")
+        return {
+            "ok": True,
+            "passed": completed.returncode == 0,
+            "command": "python -m pytest -q",
+            "exit_code": completed.returncode,
+            "timed_out": False,
+            "timeout_seconds": self._TEST_TIMEOUT_SECONDS,
+            "duration_seconds": round(time.monotonic() - started_at, 3),
+            "output": output,
+            "output_truncated": output_truncated,
+        }
+
     def _read_utf8_text(self, target: Path, display_path: str) -> tuple[str, int]:
         """在固定字节上限内读取 UTF-8 文本。"""
 
@@ -501,6 +567,50 @@ class SafeWorkspace:
                     temporary_path.unlink(missing_ok=True)
                 except OSError:
                     pass
+
+    @classmethod
+    def _sanitized_test_environment(cls) -> dict[str, str]:
+        """移除常见凭据和可注入 pytest/Python 行为的环境变量。"""
+
+        environment = {
+            name: value
+            for name, value in os.environ.items()
+            if not any(marker in name.upper() for marker in cls._SENSITIVE_ENV_MARKERS)
+        }
+        injected_behavior_variables = (
+            "PYTHONINSPECT",
+            "PYTHONPATH",
+            "PYTHONSTARTUP",
+            "PYTEST_ADDOPTS",
+            "PYTEST_PLUGINS",
+        )
+        for name in injected_behavior_variables:
+            environment.pop(name, None)
+        environment["PYTHONIOENCODING"] = "utf-8"
+        environment["PYTHONUTF8"] = "1"
+        environment["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
+        return environment
+
+    @classmethod
+    def _truncate_test_output(cls, output: str) -> tuple[str, bool]:
+        """保留测试输出的开头和结尾，避免失败详情挤出模型上下文。"""
+
+        if len(output) <= cls._MAX_TEST_OUTPUT_CHARS:
+            return output, False
+        marker = "\n... [测试输出已截断] ...\n"
+        head_chars = min(5_000, cls._MAX_TEST_OUTPUT_CHARS // 4)
+        tail_chars = cls._MAX_TEST_OUTPUT_CHARS - head_chars - len(marker)
+        return f"{output[:head_chars]}{marker}{output[-tail_chars:]}", True
+
+    @staticmethod
+    def _decode_test_output(output: str | bytes | None) -> str:
+        """统一 TimeoutExpired 可能返回的文本或字节输出。"""
+
+        if output is None:
+            return ""
+        if isinstance(output, bytes):
+            return output.decode("utf-8", errors="replace")
+        return output
 
     def _collect_visible_search_files(
         self,
@@ -767,6 +877,22 @@ def build_agent_registry(workspace: SafeWorkspace) -> ToolRegistry:
             file_access=ToolFileAccess.WRITE,
             path_argument="path",
             path_normalizer=workspace.canonical_file_path,
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="run_tests",
+            description=(
+                "在工作区运行固定命令 python -m pytest -q。该工具不接受命令参数，"
+                "并返回通过状态、退出码和受限输出。每次修改后必须调用。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+            handler=workspace.run_tests,
+            records_test_result=True,
         )
     )
     return registry
