@@ -1,12 +1,14 @@
 import json
 import unittest
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
 from unittest.mock import patch
 
 from safe_patch_agent.agent import (
+    AgentEvent,
+    AgentEventKind,
     AgentLoopLimitError,
     AgentToolLimitError,
     AgentVerificationError,
@@ -33,6 +35,28 @@ class ScriptedClient:
         return self.completions.pop(0)
 
 
+class StreamingScriptedClient(ScriptedClient):
+    def __init__(self, completions: Sequence[ChatCompletion]) -> None:
+        super().__init__(completions)
+        self.stream_calls = 0
+
+    def stream_complete(
+        self,
+        messages: Sequence[ChatMessage],
+        tools: Sequence[Mapping[str, Any]],
+        on_text_delta: Callable[[str], None] | None = None,
+    ) -> ChatCompletion:
+        self.stream_calls += 1
+        self.requests.append((list(messages), list(tools)))
+        completion = self.completions.pop(0)
+        content = completion.message.content
+        if content and on_text_delta is not None:
+            midpoint = max(1, len(content) // 2)
+            on_text_delta(content[:midpoint])
+            on_text_delta(content[midpoint:])
+        return completion
+
+
 class CountingRegistry(ToolRegistry):
     def __init__(self) -> None:
         super().__init__()
@@ -54,6 +78,84 @@ def build_approved_registry(root: Path) -> ToolRegistry:
 
 
 class AgentTests(unittest.TestCase):
+    def test_streaming_agent_emits_model_text_and_tool_progress_events(self) -> None:
+        registry = CountingRegistry()
+        call = ToolCall(id="call-1", name="list_files", arguments={})
+        client = StreamingScriptedClient(
+            [
+                ChatCompletion(ChatMessage.assistant(None, (call,)), "tool_calls"),
+                ChatCompletion(ChatMessage.assistant("任务完成。"), "stop"),
+            ]
+        )
+        events: list[AgentEvent] = []
+
+        result = CodingAgent(client, registry).run(
+            "检查项目",
+            event_handler=events.append,
+            stream=True,
+        )
+
+        self.assertEqual(result.answer, "任务完成。")
+        self.assertEqual(client.stream_calls, 2)
+        self.assertEqual(
+            [event.kind for event in events],
+            [
+                AgentEventKind.MODEL_START,
+                AgentEventKind.MODEL_COMPLETE,
+                AgentEventKind.TOOL_START,
+                AgentEventKind.TOOL_COMPLETE,
+                AgentEventKind.MODEL_START,
+                AgentEventKind.TEXT_DELTA,
+                AgentEventKind.TEXT_DELTA,
+                AgentEventKind.MODEL_COMPLETE,
+            ],
+        )
+        tool_complete = next(
+            event
+            for event in events
+            if event.kind is AgentEventKind.TOOL_COMPLETE
+        )
+        self.assertEqual(tool_complete.tool_name, "list_files")
+        self.assertTrue(tool_complete.succeeded)
+        self.assertIsNotNone(tool_complete.duration_seconds)
+        self.assertEqual(
+            "".join(event.text or "" for event in events),
+            "任务完成。",
+        )
+
+    def test_streaming_capable_client_remains_synchronous_by_default(self) -> None:
+        client = StreamingScriptedClient(
+            [ChatCompletion(ChatMessage.assistant("同步完成。"), "stop")]
+        )
+
+        result = CodingAgent(client, CountingRegistry()).run("执行")
+
+        self.assertEqual(result.answer, "同步完成。")
+        self.assertEqual(client.stream_calls, 0)
+
+    def test_progress_observer_failure_does_not_abort_agent(self) -> None:
+        client = ScriptedClient(
+            [ChatCompletion(ChatMessage.assistant("完成。"), "stop")]
+        )
+
+        def broken_observer(_event: AgentEvent) -> None:
+            raise RuntimeError("显示失败")
+
+        result = CodingAgent(client, CountingRegistry()).run(
+            "执行",
+            event_handler=broken_observer,
+        )
+
+        self.assertEqual(result.answer, "完成。")
+
+    def test_agent_rejects_invalid_progress_options(self) -> None:
+        agent = CodingAgent(ScriptedClient([]), CountingRegistry())
+
+        with self.assertRaisesRegex(ValueError, "event_handler"):
+            agent.run("执行", event_handler=True)  # type: ignore[arg-type]
+        with self.assertRaisesRegex(ValueError, "stream"):
+            agent.run("执行", stream="yes")  # type: ignore[arg-type]
+
     def test_tool_result_is_sent_back_before_final_answer(self) -> None:
         with TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -267,11 +369,15 @@ class AgentTests(unittest.TestCase):
                     ChatCompletion(ChatMessage.assistant("修改并验证完成。"), "stop"),
                 ]
             )
+            events: list[AgentEvent] = []
 
             with patch("safe_patch_agent.workspace.subprocess.run") as run:
                 run.return_value.returncode = 0
                 run.return_value.stdout = "1 passed\n"
-                result = CodingAgent(client, registry).run("修改并测试")
+                result = CodingAgent(client, registry).run(
+                    "修改并测试",
+                    event_handler=events.append,
+                )
 
         self.assertEqual(result.answer, "修改并验证完成。")
         self.assertEqual(result.model_rounds, 5)
@@ -281,6 +387,10 @@ class AgentTests(unittest.TestCase):
         reminder = client.requests[3][0][-1]
         self.assertEqual(reminder.role.value, "system")
         self.assertIn("必须调用 run_tests", reminder.content)
+        self.assertIn(
+            AgentEventKind.VERIFICATION_REQUIRED,
+            [event.kind for event in events],
+        )
 
     def test_agent_errors_when_round_limit_prevents_required_test(self) -> None:
         with TemporaryDirectory() as temporary_directory:

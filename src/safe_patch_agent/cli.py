@@ -8,7 +8,13 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import TextIO
 
-from safe_patch_agent.agent import AgentError, CodingAgent, CodingSession
+from safe_patch_agent.agent import (
+    AgentError,
+    AgentEvent,
+    AgentEventKind,
+    CodingAgent,
+    CodingSession,
+)
 from safe_patch_agent.changes import ChangeJournal
 from safe_patch_agent.config import ConfigurationError, LLMConfig
 from safe_patch_agent.llm_client import LLMError, OpenAICompatibleClient
@@ -89,6 +95,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--chat",
         action="store_true",
         help="完成可选的初始任务后继续保持聊天会话",
+    )
+    parser.add_argument(
+        "--no-stream",
+        action="store_true",
+        help="禁用模型 SSE 流式响应；仍显示工具执行进度",
     )
     parser.add_argument("-h", "--help", action="help", help="显示帮助信息并退出")
     return parser
@@ -207,11 +218,90 @@ def parse_rollback_target(command: str) -> int | str | None:
     return change_id
 
 
+class CLIProgressRenderer:
+    """把 Agent 进度事件渲染为不泄露工具结果正文的终端输出。"""
+
+    def __init__(self, output_stream: TextIO) -> None:
+        self.output_stream = output_stream
+        self.final_answer_streamed = False
+        self._text_rounds: set[int] = set()
+        self._line_open = False
+
+    def __call__(self, event: AgentEvent) -> None:
+        if event.kind is AgentEventKind.MODEL_START:
+            self.final_answer_streamed = False
+            self._ensure_newline()
+            print(
+                f"\n[模型] 第 {event.round_number} 轮生成中...",
+                file=self.output_stream,
+                flush=True,
+            )
+            return
+        if event.kind is AgentEventKind.TEXT_DELTA:
+            text = event.text or ""
+            if event.round_number not in self._text_rounds:
+                print("\nAgent> ", end="", file=self.output_stream, flush=True)
+                self._text_rounds.add(event.round_number)
+                self._line_open = True
+            print(text, end="", file=self.output_stream, flush=True)
+            if text:
+                self._line_open = not text.endswith(("\n", "\r"))
+            return
+        if event.kind is AgentEventKind.MODEL_COMPLETE:
+            self._ensure_newline()
+            self.final_answer_streamed = (
+                event.has_tool_calls is False
+                and event.round_number in self._text_rounds
+            )
+            return
+        if event.kind is AgentEventKind.TOOL_START:
+            self._ensure_newline()
+            print(
+                f"[工具] 开始 {event.tool_name}",
+                file=self.output_stream,
+                flush=True,
+            )
+            return
+        if event.kind is AgentEventKind.TOOL_COMPLETE:
+            self._ensure_newline()
+            if event.succeeded is True:
+                status = "成功"
+            elif event.succeeded is False:
+                status = "失败"
+            else:
+                status = "状态未知"
+            duration = (
+                f"，{event.duration_seconds:.3f} 秒"
+                if event.duration_seconds is not None
+                else ""
+            )
+            print(
+                f"[工具] 完成 {event.tool_name}（{status}{duration}）",
+                file=self.output_stream,
+                flush=True,
+            )
+            return
+        if event.kind is AgentEventKind.VERIFICATION_REQUIRED:
+            self.final_answer_streamed = False
+            self._ensure_newline()
+            print(
+                "[验证] 检测到尚未测试的修改，继续请求模型运行固定测试。",
+                file=self.output_stream,
+                flush=True,
+            )
+
+    def _ensure_newline(self) -> None:
+        if self._line_open:
+            print(file=self.output_stream, flush=True)
+            self._line_open = False
+
+
 def run_chat(
     session: CodingSession,
     *,
     change_journal: ChangeJournal | None = None,
     workspace: SafeWorkspace | None = None,
+    stream: bool = True,
     initial_goal: str | None = None,
     input_stream: TextIO | None = None,
     output_stream: TextIO | None = None,
@@ -286,14 +376,20 @@ def run_chat(
             continue
 
         try:
-            result = session.run(goal)
+            progress = CLIProgressRenderer(output_stream)
+            result = session.run(
+                goal,
+                event_handler=progress,
+                stream=stream,
+            )
         except (AgentError, LLMError, ValueError) as exc:
             print(f"\n本轮错误：{exc}", file=output_stream)
             continue
         except KeyboardInterrupt:
             print("\n本轮已中断，可以继续输入任务。", file=output_stream)
             continue
-        print(f"\nAgent> {result.answer}", file=output_stream)
+        if not progress.final_answer_streamed:
+            print(f"\nAgent> {result.answer}", file=output_stream)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -322,14 +418,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                 CodingSession(agent),
                 change_journal=change_journal,
                 workspace=workspace,
+                stream=not args.no_stream,
                 initial_goal=args.goal,
             )
-        result = agent.run(args.goal)
+        progress = CLIProgressRenderer(sys.stdout)
+        result = agent.run(
+            args.goal,
+            event_handler=progress,
+            stream=not args.no_stream,
+        )
     except (ConfigurationError, WorkspaceError, LLMError, AgentError, ValueError) as exc:
         print(f"错误：{exc}", file=sys.stderr)
         return 1
 
-    print(result.answer)
+    if not progress.final_answer_streamed:
+        print(result.answer)
     return 0
 
 

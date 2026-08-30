@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import json
+import time
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from enum import StrEnum
 
 from safe_patch_agent.llm_client import LLMClient
 from safe_patch_agent.messages import ChatMessage
@@ -43,6 +47,34 @@ class AgentVerificationError(AgentError):
     """Agent 在模型轮次耗尽前没有验证最新修改。"""
 
 
+class AgentEventKind(StrEnum):
+    """供命令行等观察者消费的 Agent 进度事件类型。"""
+
+    MODEL_START = "model_start"
+    TEXT_DELTA = "text_delta"
+    MODEL_COMPLETE = "model_complete"
+    TOOL_START = "tool_start"
+    TOOL_COMPLETE = "tool_complete"
+    VERIFICATION_REQUIRED = "verification_required"
+
+
+@dataclass(frozen=True)
+class AgentEvent:
+    """不包含工具结果正文的轻量运行进度事件。"""
+
+    kind: AgentEventKind
+    round_number: int
+    text: str | None = None
+    tool_name: str | None = None
+    tool_call_id: str | None = None
+    succeeded: bool | None = None
+    duration_seconds: float | None = None
+    has_tool_calls: bool | None = None
+
+
+AgentEventHandler = Callable[[AgentEvent], None]
+
+
 @dataclass(frozen=True)
 class AgentResult:
     answer: str
@@ -74,22 +106,39 @@ class CodingAgent:
         self.max_tool_calls = max_tool_calls
         self.system_prompt = system_prompt
 
-    def run(self, goal: str) -> AgentResult:
+    def run(
+        self,
+        goal: str,
+        *,
+        event_handler: AgentEventHandler | None = None,
+        stream: bool = False,
+    ) -> AgentResult:
         """执行一个不继承历史的独立任务。"""
 
-        return self._run(goal, history=())
+        return self._run(
+            goal,
+            history=(),
+            event_handler=event_handler,
+            stream=stream,
+        )
 
     def _run(
         self,
         goal: str,
         *,
         history: tuple[ChatMessage, ...],
+        event_handler: AgentEventHandler | None = None,
+        stream: bool = False,
     ) -> AgentResult:
         """执行一轮任务，并在系统提示词后附加已压缩的会话历史。"""
 
         goal = goal.strip()
         if not goal:
             raise ValueError("任务目标不能为空")
+        if event_handler is not None and not callable(event_handler):
+            raise ValueError("event_handler 必须是可调用对象")
+        if not isinstance(stream, bool):
+            raise ValueError("stream 必须是布尔值")
 
         self.registry.state.start_turn()
         messages = [
@@ -100,9 +149,36 @@ class CodingAgent:
         tool_call_count = 0
 
         for round_number in range(1, self.max_rounds + 1):
-            completion = self.client.complete(messages, self.registry.schemas())
+            self._emit(
+                event_handler,
+                AgentEvent(AgentEventKind.MODEL_START, round_number),
+            )
+            stream_complete = getattr(self.client, "stream_complete", None)
+            if stream and callable(stream_complete):
+                completion = stream_complete(
+                    messages,
+                    self.registry.schemas(),
+                    lambda text, current_round=round_number: self._emit(
+                        event_handler,
+                        AgentEvent(
+                            AgentEventKind.TEXT_DELTA,
+                            current_round,
+                            text=text,
+                        ),
+                    ),
+                )
+            else:
+                completion = self.client.complete(messages, self.registry.schemas())
             assistant_message = completion.message
             messages.append(assistant_message)
+            self._emit(
+                event_handler,
+                AgentEvent(
+                    AgentEventKind.MODEL_COMPLETE,
+                    round_number,
+                    has_tool_calls=bool(assistant_message.tool_calls),
+                ),
+            )
 
             if completion.finish_reason == "length":
                 raise AgentError("模型输出在完整轮次结束前被截断")
@@ -116,6 +192,13 @@ class CodingAgent:
                 if not answer:
                     raise AgentError("模型既没有返回工具调用，也没有给出最终答案")
                 if self.registry.state.has_unverified_changes:
+                    self._emit(
+                        event_handler,
+                        AgentEvent(
+                            AgentEventKind.VERIFICATION_REQUIRED,
+                            round_number,
+                        ),
+                    )
                     if round_number >= self.max_rounds:
                         raise AgentVerificationError(
                             "Agent 修改了文件，但在模型调用上限内没有运行测试"
@@ -137,12 +220,58 @@ class CodingAgent:
                 )
             for call in assistant_message.tool_calls:
                 tool_call_count += 1
+                self._emit(
+                    event_handler,
+                    AgentEvent(
+                        AgentEventKind.TOOL_START,
+                        round_number,
+                        tool_name=call.name,
+                        tool_call_id=call.id,
+                    ),
+                )
+                started_at = time.monotonic()
                 result = self.registry.execute(call)
+                self._emit(
+                    event_handler,
+                    AgentEvent(
+                        AgentEventKind.TOOL_COMPLETE,
+                        round_number,
+                        tool_name=call.name,
+                        tool_call_id=call.id,
+                        succeeded=self._tool_result_succeeded(result),
+                        duration_seconds=round(time.monotonic() - started_at, 3),
+                    ),
+                )
                 messages.append(ChatMessage.tool(call, result))
 
         raise AgentLoopLimitError(
             f"Agent 已达到 {self.max_rounds} 轮模型调用上限，但仍未获得最终答案"
         )
+
+    @staticmethod
+    def _emit(
+        event_handler: AgentEventHandler | None,
+        event: AgentEvent,
+    ) -> None:
+        """隔离普通观察者异常，但允许 Ctrl+C 继续中断 Agent。"""
+
+        if event_handler is None:
+            return
+        try:
+            event_handler(event)
+        except Exception:
+            return
+
+    @staticmethod
+    def _tool_result_succeeded(result: str) -> bool | None:
+        try:
+            payload = json.loads(result)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(payload, Mapping):
+            return None
+        succeeded = payload.get("ok")
+        return succeeded if isinstance(succeeded, bool) else None
 
 
 @dataclass(frozen=True)
@@ -195,7 +324,13 @@ class CodingSession:
         for path in paths:
             self.agent.registry.state.mark_file_modified(path)
 
-    def run(self, goal: str) -> AgentResult:
+    def run(
+        self,
+        goal: str,
+        *,
+        event_handler: AgentEventHandler | None = None,
+        stream: bool = False,
+    ) -> AgentResult:
         """在最近的有界问答历史之后执行新一轮任务。"""
 
         normalized_goal = goal.strip()
@@ -204,6 +339,8 @@ class CodingSession:
         result = self.agent._run(
             normalized_goal,
             history=self._history_messages(),
+            event_handler=event_handler,
+            stream=stream,
         )
         self._turns.append(
             ConversationTurn(

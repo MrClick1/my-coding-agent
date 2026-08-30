@@ -5,10 +5,13 @@ from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch
 
+from safe_patch_agent.agent import AgentEvent, AgentEventKind
 from safe_patch_agent.changes import ChangeJournal
 from safe_patch_agent.cli import (
+    CLIProgressRenderer,
     build_parser,
     format_change_log,
     main,
@@ -31,7 +34,7 @@ class FakeSession:
         self.clear_count = 0
         self.external_modifications: list[tuple[str, ...]] = []
 
-    def run(self, goal: str) -> SimpleNamespace:
+    def run(self, goal: str, **_kwargs: Any) -> SimpleNamespace:
         self.goals.append(goal)
         return SimpleNamespace(answer=f"已处理：{goal}")
 
@@ -40,6 +43,24 @@ class FakeSession:
 
     def mark_external_modifications(self, paths: tuple[str, ...]) -> None:
         self.external_modifications.append(paths)
+
+
+class StreamingFakeSession(FakeSession):
+    def run(self, goal: str, **kwargs: Any) -> SimpleNamespace:
+        self.goals.append(goal)
+        event_handler = kwargs["event_handler"]
+        self.stream_enabled = kwargs["stream"]
+        event_handler(AgentEvent(AgentEventKind.MODEL_START, 1))
+        event_handler(AgentEvent(AgentEventKind.TEXT_DELTA, 1, text="已处理："))
+        event_handler(AgentEvent(AgentEventKind.TEXT_DELTA, 1, text=goal))
+        event_handler(
+            AgentEvent(
+                AgentEventKind.MODEL_COMPLETE,
+                1,
+                has_tool_calls=False,
+            )
+        )
+        return SimpleNamespace(answer=f"已处理：{goal}")
 
 
 class CLITests(unittest.TestCase):
@@ -55,11 +76,13 @@ class CLITests(unittest.TestCase):
 
         chat_args = parser.parse_args([])
         initial_chat_args = parser.parse_args(["初始任务", "--chat"])
+        no_stream_args = parser.parse_args(["任务", "--no-stream"])
 
         self.assertIsNone(chat_args.goal)
         self.assertFalse(chat_args.chat)
         self.assertEqual(initial_chat_args.goal, "初始任务")
         self.assertTrue(initial_chat_args.chat)
+        self.assertTrue(no_stream_args.no_stream)
 
     def test_missing_model_configuration_returns_clear_error(self) -> None:
         with TemporaryDirectory() as temporary_directory:
@@ -247,6 +270,61 @@ class CLITests(unittest.TestCase):
         self.assertIn("#1 [待测试]", output.getvalue())
         self.assertIn("已回滚修改 #1", output.getvalue())
         self.assertIn("#1 [已回滚]", output.getvalue())
+
+    def test_chat_streams_final_answer_without_printing_it_twice(self) -> None:
+        session = StreamingFakeSession()
+        output = StringIO()
+
+        exit_code = run_chat(  # type: ignore[arg-type]
+            session,
+            input_stream=InteractiveStringIO("任务\n/exit\n"),
+            output_stream=output,
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(session.stream_enabled)
+        self.assertEqual(output.getvalue().count("Agent> 已处理：任务"), 1)
+        self.assertIn("[模型] 第 1 轮生成中", output.getvalue())
+
+    def test_progress_renderer_shows_tool_status_and_verification_notice(self) -> None:
+        output = StringIO()
+        renderer = CLIProgressRenderer(output)
+
+        renderer(AgentEvent(AgentEventKind.MODEL_START, 1))
+        renderer(AgentEvent(AgentEventKind.TEXT_DELTA, 1, text="准备修改"))
+        renderer(
+            AgentEvent(
+                AgentEventKind.MODEL_COMPLETE,
+                1,
+                has_tool_calls=True,
+            )
+        )
+        renderer(
+            AgentEvent(
+                AgentEventKind.TOOL_START,
+                1,
+                tool_name="replace_text",
+                tool_call_id="call-1",
+            )
+        )
+        renderer(
+            AgentEvent(
+                AgentEventKind.TOOL_COMPLETE,
+                1,
+                tool_name="replace_text",
+                tool_call_id="call-1",
+                succeeded=True,
+                duration_seconds=0.125,
+            )
+        )
+        renderer(AgentEvent(AgentEventKind.VERIFICATION_REQUIRED, 1))
+
+        rendered = output.getvalue()
+        self.assertIn("Agent> 准备修改", rendered)
+        self.assertIn("[工具] 开始 replace_text", rendered)
+        self.assertIn("[工具] 完成 replace_text（成功，0.125 秒）", rendered)
+        self.assertIn("尚未测试", rendered)
+        self.assertFalse(renderer.final_answer_streamed)
 
     def test_chat_rejects_non_interactive_input(self) -> None:
         session = FakeSession()
