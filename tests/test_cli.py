@@ -16,6 +16,7 @@ from safe_patch_agent.cli import (
     format_change_log,
     main,
     parse_rollback_target,
+    request_batch_change_approval,
     request_creation_approval,
     request_deletion_approval,
     request_replacement_approval,
@@ -23,6 +24,7 @@ from safe_patch_agent.cli import (
     run_chat,
 )
 from safe_patch_agent.workspace import (
+    BatchChangePreview,
     CreationPreview,
     DeletionPreview,
     ReplacementPreview,
@@ -215,6 +217,45 @@ class CLITests(unittest.TestCase):
         output = StringIO()
 
         approved = request_deletion_approval(
+            preview,
+            input_stream=StringIO("yes\n"),
+            output_stream=output,
+        )
+
+        self.assertFalse(approved)
+        self.assertIn("不是交互式终端", output.getvalue())
+
+    def test_batch_approval_shows_summary_full_diff_and_one_prompt(self) -> None:
+        preview = BatchChangePreview(
+            paths=("new.py", "old.py"),
+            diff="--- /dev/null\n+++ b/new.py\n+new\n--- a/old.py\n+++ /dev/null\n-old\n",
+            creations=1,
+            replacements=0,
+            deletions=1,
+            original_bytes=4,
+            updated_bytes=4,
+        )
+        output = StringIO()
+
+        approved = request_batch_change_approval(
+            preview,
+            input_stream=InteractiveStringIO("yes\n"),
+            output_stream=output,
+        )
+
+        rendered = output.getvalue()
+        self.assertTrue(approved)
+        self.assertIn("SafePatch 批量变更预览", rendered)
+        self.assertIn("共 2 个文件；创建 1；替换 0；删除 1", rendered)
+        self.assertIn("new.py, old.py", rendered)
+        self.assertIn("+++ /dev/null", rendered)
+        self.assertEqual(rendered.count("应用以上批量变更？"), 1)
+
+    def test_non_interactive_input_cannot_approve_batch_change(self) -> None:
+        preview = BatchChangePreview(("new.py",), "+new\n", 1, 0, 0, 0, 4)
+        output = StringIO()
+
+        approved = request_batch_change_approval(
             preview,
             input_stream=StringIO("yes\n"),
             output_stream=output,

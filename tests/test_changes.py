@@ -132,6 +132,17 @@ class ChangeJournalTests(unittest.TestCase):
                 replacements=1,
             )
 
+    def test_batch_capacity_is_checked_as_one_preflight(self) -> None:
+        journal = ChangeJournal(max_records=2, max_stored_bytes=20)
+
+        journal.ensure_can_record_many(((None, "new"), ("old", None)))
+
+        journal.record_creation(path="new.py", after_text="new", diff="diff")
+        with self.assertRaisesRegex(ChangeJournalError, "2 条上限"):
+            journal.ensure_can_record_many((("a", "b"), ("c", "d")))
+        with self.assertRaisesRegex(ChangeJournalError, "至少需要一项"):
+            journal.ensure_can_record_many(())
+
     def test_invalid_or_missing_rollback_target_is_rejected(self) -> None:
         journal = ChangeJournal()
 

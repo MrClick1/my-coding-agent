@@ -19,6 +19,7 @@ from safe_patch_agent.changes import ChangeJournal, ChangeKind
 from safe_patch_agent.config import ConfigurationError, LLMConfig
 from safe_patch_agent.llm_client import LLMError, OpenAICompatibleClient
 from safe_patch_agent.workspace import (
+    BatchChangePreview,
     CreationPreview,
     DeletionPreview,
     ReplacementPreview,
@@ -58,7 +59,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = ChineseArgumentParser(
         prog="safe-patch-agent",
         description=(
-            "运行具备持续聊天、代码搜索、人工确认文件创建/精确替换/删除和固定测试能力的编程 Agent。"
+            "运行具备持续聊天、代码搜索、人工确认单项/批量文件变更和固定测试能力的编程 Agent。"
         ),
         add_help=False,
     )
@@ -201,6 +202,41 @@ def request_deletion_approval(
     approved = answer.strip().casefold() in {"y", "yes", "是"}
     if not approved:
         print("删除未获批准，已取消。", file=output_stream)
+    return approved
+
+
+def request_batch_change_approval(
+    preview: BatchChangePreview,
+    *,
+    input_stream: TextIO | None = None,
+    output_stream: TextIO | None = None,
+) -> bool:
+    """汇总展示一组文件变更，并读取用户的一次明确批准。"""
+
+    input_stream = sys.stdin if input_stream is None else input_stream
+    output_stream = sys.stderr if output_stream is None else output_stream
+    if not input_stream.isatty():
+        print("无法确认批量变更：当前输入不是交互式终端。", file=output_stream)
+        return False
+
+    print("\n=== SafePatch 批量变更预览 ===", file=output_stream)
+    print(
+        f"共 {len(preview.paths)} 个文件；创建 {preview.creations}；"
+        f"替换 {preview.replacements}；删除 {preview.deletions}；"
+        f"总大小：{preview.original_bytes} -> {preview.updated_bytes} 字节",
+        file=output_stream,
+    )
+    print(f"文件：{', '.join(preview.paths)}", file=output_stream)
+    print(preview.diff, end="", file=output_stream)
+    print("应用以上批量变更？[y/N]：", end="", file=output_stream, flush=True)
+    try:
+        answer = input_stream.readline()
+    except (OSError, KeyboardInterrupt):
+        print("\n未获得确认，批量变更已取消。", file=output_stream)
+        return False
+    approved = answer.strip().casefold() in {"y", "yes", "是"}
+    if not approved:
+        print("批量变更未获批准，已取消。", file=output_stream)
     return approved
 
 
@@ -499,6 +535,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             replacement_approval=request_replacement_approval,
             creation_approval=request_creation_approval,
             deletion_approval=request_deletion_approval,
+            batch_change_approval=request_batch_change_approval,
             change_journal=change_journal,
             rollback_approval=request_rollback_approval,
         )

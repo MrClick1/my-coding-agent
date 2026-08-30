@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import inspect
 import json
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
@@ -29,6 +29,12 @@ class ToolFileAccess(StrEnum):
     DELETE = "delete"
 
 
+FileAccessResolver = Callable[
+    [Mapping[str, Any]],
+    Sequence[tuple[ToolFileAccess, str]],
+]
+
+
 @dataclass(frozen=True)
 class ToolDefinition:
     """可调用函数，以及展示给模型的 JSON Schema。"""
@@ -40,6 +46,7 @@ class ToolDefinition:
     file_access: ToolFileAccess | None = None
     path_argument: str | None = None
     path_normalizer: PathNormalizer | None = None
+    file_access_resolver: FileAccessResolver | None = None
     records_test_result: bool = False
 
     def __post_init__(self) -> None:
@@ -57,6 +64,18 @@ class ToolDefinition:
         if (self.file_access is None) != (self.path_argument is None):
             raise ToolRegistrationError(
                 f"工具 {self.name!r} 必须同时配置 file_access 和 path_argument"
+            )
+        if self.file_access_resolver is not None and (
+            self.file_access is not None or self.path_normalizer is not None
+        ):
+            raise ToolRegistrationError(
+                f"工具 {self.name!r} 不能同时配置单路径访问和批量访问解析器"
+            )
+        if self.file_access_resolver is not None and not callable(
+            self.file_access_resolver
+        ):
+            raise ToolRegistrationError(
+                f"工具 {self.name!r} 的 file_access_resolver 必须可调用"
             )
         if self.path_argument is not None and (
             not isinstance(self.path_argument, str) or not self.path_argument
@@ -138,14 +157,14 @@ class ToolRegistry:
                 )
 
         try:
-            accessed_path = self._prepare_file_access(definition, arguments)
+            accessed_paths = self._prepare_file_access(definition, arguments)
             result = definition.handler(**arguments)
             if isinstance(result, Mapping):
                 payload: Any = dict(result)
             else:
                 payload = {"ok": True, "result": result}
             if payload.get("ok", True):
-                self._record_file_access(definition, accessed_path, payload)
+                self._record_file_access(definition, accessed_paths, payload)
                 self._record_test_result(definition, payload)
         except ValueError as exc:
             return _json_result(
@@ -171,11 +190,34 @@ class ToolRegistry:
         self,
         definition: ToolDefinition,
         arguments: Mapping[str, Any],
-    ) -> str | None:
+    ) -> tuple[tuple[ToolFileAccess, str], ...]:
         """在处理器运行前执行写入授权检查。"""
 
+        if definition.file_access_resolver is not None:
+            resolved_accesses = definition.file_access_resolver(arguments)
+            if isinstance(resolved_accesses, (str, bytes)):
+                raise ValueError("批量文件访问解析器必须返回访问项序列")
+            accesses: list[tuple[ToolFileAccess, str]] = []
+            for item in resolved_accesses:
+                if not isinstance(item, (tuple, list)) or len(item) != 2:
+                    raise ValueError("批量文件访问项必须包含访问类型和路径")
+                access, path = item
+                if not isinstance(access, ToolFileAccess):
+                    try:
+                        access = ToolFileAccess(access)
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError("批量文件访问类型无效") from exc
+                if not isinstance(path, str) or not path:
+                    raise ValueError("批量文件访问路径必须是非空字符串")
+                if access in {ToolFileAccess.WRITE, ToolFileAccess.DELETE}:
+                    self.state.require_file_read(path)
+                accesses.append((access, path))
+            if not accesses:
+                raise ValueError("批量文件访问解析器至少需要返回一项访问")
+            return tuple(accesses)
+
         if definition.file_access is None or definition.path_argument is None:
-            return None
+            return ()
         path = arguments.get(definition.path_argument)
         if not isinstance(path, str):
             raise ValueError(f"工具参数 {definition.path_argument!r} 必须是字符串")
@@ -185,34 +227,36 @@ class ToolRegistry:
                 raise ValueError("工具的路径规范化器必须返回非空字符串")
         if definition.file_access in {ToolFileAccess.WRITE, ToolFileAccess.DELETE}:
             self.state.require_file_read(path)
-        return path
+        return ((definition.file_access, path),)
 
     def _record_file_access(
         self,
         definition: ToolDefinition,
-        requested_path: str | None,
+        requested_paths: tuple[tuple[ToolFileAccess, str], ...],
         payload: Mapping[str, Any],
     ) -> None:
         """只在工具成功后记录实际访问的规范化路径。"""
 
-        if definition.file_access is None or requested_path is None:
+        if not requested_paths:
             return
-        result_path = (
-            requested_path
-            if definition.file_access in {ToolFileAccess.WRITE, ToolFileAccess.DELETE}
-            or definition.path_normalizer is not None
-            else payload.get("path", requested_path)
-        )
-        if not isinstance(result_path, str):
-            result_path = requested_path
-        if definition.file_access is ToolFileAccess.READ:
-            self.state.mark_file_read(result_path)
-        elif definition.file_access in {
-            ToolFileAccess.WRITE,
-            ToolFileAccess.CREATE,
-            ToolFileAccess.DELETE,
-        }:
-            self.state.mark_file_modified(result_path)
+        for access, requested_path in requested_paths:
+            result_path = (
+                payload.get("path", requested_path)
+                if access is ToolFileAccess.READ
+                and definition.file_access_resolver is None
+                and definition.path_normalizer is None
+                else requested_path
+            )
+            if not isinstance(result_path, str):
+                result_path = requested_path
+            if access is ToolFileAccess.READ:
+                self.state.mark_file_read(result_path)
+            elif access in {
+                ToolFileAccess.WRITE,
+                ToolFileAccess.CREATE,
+                ToolFileAccess.DELETE,
+            }:
+                self.state.mark_file_modified(result_path)
 
     def _record_test_result(
         self,

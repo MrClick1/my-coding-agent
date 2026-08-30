@@ -228,6 +228,9 @@ class BenchmarkRunner:
                     SafeWorkspace(
                         workspace_root,
                         replacement_approval=lambda _preview: True,
+                        creation_approval=lambda _preview: True,
+                        deletion_approval=lambda _preview: True,
+                        batch_change_approval=lambda _preview: True,
                     )
                 )
             )

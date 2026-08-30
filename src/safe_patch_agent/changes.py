@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -99,11 +100,25 @@ class ChangeJournal:
     ) -> None:
         """在写文件前确认日志能够完整保存可回滚内容。"""
 
-        if len(self._records) >= self.max_records:
+        self.ensure_can_record_many(((before_text, after_text),))
+
+    def ensure_can_record_many(
+        self,
+        changes: Sequence[tuple[str | None, str | None]],
+    ) -> None:
+        """在批量写入前一次性确认日志条数和正文容量。"""
+
+        change_count = len(changes)
+        if change_count < 1:
+            raise ChangeJournalError("批量修改日志预检至少需要一项变更")
+        if len(self._records) + change_count > self.max_records:
             raise ChangeJournalError(
                 f"修改日志已达到 {self.max_records} 条上限；文件未修改"
             )
-        required_bytes = _encoded_size(before_text) + _encoded_size(after_text)
+        required_bytes = sum(
+            _encoded_size(before_text) + _encoded_size(after_text)
+            for before_text, after_text in changes
+        )
         if self._stored_bytes + required_bytes > self.max_stored_bytes:
             raise ChangeJournalError(
                 "修改日志保存的可回滚内容将超过 "

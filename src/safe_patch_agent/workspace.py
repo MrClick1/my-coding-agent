@@ -11,12 +11,12 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from safe_patch_agent.changes import ChangeJournal, ChangeJournalError
+from safe_patch_agent.changes import ChangeJournal, ChangeJournalError, ChangeKind
 from safe_patch_agent.tooling import ToolDefinition, ToolFileAccess, ToolRegistry
 
 
@@ -63,6 +63,37 @@ DeletionApproval = Callable[[DeletionPreview], bool]
 
 
 @dataclass(frozen=True)
+class BatchChangePreview:
+    """等待用户统一确认的一组文件变更预览。"""
+
+    paths: tuple[str, ...]
+    diff: str
+    creations: int
+    replacements: int
+    deletions: int
+    original_bytes: int
+    updated_bytes: int
+
+
+BatchChangeApproval = Callable[[BatchChangePreview], bool]
+
+
+@dataclass(frozen=True)
+class _PreparedChange:
+    """已经完成输入和工作区状态校验、等待提交的一项文件变更。"""
+
+    kind: ChangeKind
+    path: str
+    target: Path
+    before_text: str | None
+    after_text: str | None
+    diff: str
+    replacements: int
+    original_bytes: int
+    updated_bytes: int
+
+
+@dataclass(frozen=True)
 class RollbackPreview:
     """等待用户确认的一次会话修改回滚预览。"""
 
@@ -92,6 +123,7 @@ class SafeWorkspace:
     _MAX_SEARCH_LINE_CHARS = 500
     _MAX_SEARCH_OUTPUT_CHARS = 35_000
     _MAX_REPLACEMENTS = 100
+    _MAX_BATCH_CHANGES = 20
     _MAX_PATCH_PREVIEW_CHARS = 30_000
     _TEST_TIMEOUT_SECONDS = 120
     _MAX_TEST_OUTPUT_CHARS = 40_000
@@ -153,6 +185,7 @@ class SafeWorkspace:
         replacement_approval: ReplacementApproval | None = None,
         creation_approval: CreationApproval | None = None,
         deletion_approval: DeletionApproval | None = None,
+        batch_change_approval: BatchChangeApproval | None = None,
         change_journal: ChangeJournal | None = None,
         rollback_approval: RollbackApproval | None = None,
     ) -> None:
@@ -167,12 +200,15 @@ class SafeWorkspace:
             raise WorkspaceError("creation_approval 必须是可调用对象")
         if deletion_approval is not None and not callable(deletion_approval):
             raise WorkspaceError("deletion_approval 必须是可调用对象")
+        if batch_change_approval is not None and not callable(batch_change_approval):
+            raise WorkspaceError("batch_change_approval 必须是可调用对象")
         if rollback_approval is not None and not callable(rollback_approval):
             raise WorkspaceError("rollback_approval 必须是可调用对象")
         self.root = resolved_root
         self.replacement_approval = replacement_approval
         self.creation_approval = creation_approval
         self.deletion_approval = deletion_approval
+        self.batch_change_approval = batch_change_approval
         self.change_journal = change_journal
         self.rollback_approval = rollback_approval
 
@@ -698,6 +734,355 @@ class SafeWorkspace:
             "diff": diff,
             "original_bytes": original_bytes,
         }
+
+    def change_set_file_accesses(
+        self,
+        arguments: Mapping[str, Any],
+    ) -> tuple[tuple[ToolFileAccess, str], ...]:
+        """把批量变更参数解析为 AgentState 可检查的规范化路径访问。"""
+
+        normalized = self._normalize_change_set_operations(arguments.get("operations"))
+        access_by_kind = {
+            ChangeKind.CREATE: ToolFileAccess.CREATE,
+            ChangeKind.REPLACE: ToolFileAccess.WRITE,
+            ChangeKind.DELETE: ToolFileAccess.DELETE,
+        }
+        return tuple(
+            (access_by_kind[kind], path)
+            for kind, path, _operation in normalized
+        )
+
+    def apply_change_set(
+        self,
+        operations: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """统一预览、确认并以失败恢复方式应用一组独立文件变更。"""
+
+        normalized = self._normalize_change_set_operations(operations)
+        prepared = tuple(
+            self._prepare_change(kind, path, operation)
+            for kind, path, operation in normalized
+        )
+        diff = "".join(change.diff for change in prepared)
+        if len(diff) > self._MAX_PATCH_PREVIEW_CHARS:
+            raise WorkspaceError(
+                "批量变更预览超过 "
+                f"{self._MAX_PATCH_PREVIEW_CHARS} 字符上限，无法完整展示；"
+                "工作区未修改"
+            )
+        if self.change_journal is not None:
+            try:
+                self.change_journal.ensure_can_record_many(
+                    tuple(
+                        (change.before_text, change.after_text)
+                        for change in prepared
+                    )
+                )
+            except ChangeJournalError as exc:
+                raise WorkspaceError(str(exc)) from exc
+
+        preview = BatchChangePreview(
+            paths=tuple(change.path for change in prepared),
+            diff=diff,
+            creations=sum(change.kind is ChangeKind.CREATE for change in prepared),
+            replacements=sum(
+                change.kind is ChangeKind.REPLACE for change in prepared
+            ),
+            deletions=sum(change.kind is ChangeKind.DELETE for change in prepared),
+            original_bytes=sum(change.original_bytes for change in prepared),
+            updated_bytes=sum(change.updated_bytes for change in prepared),
+        )
+        if self.batch_change_approval is None:
+            raise WorkspaceError("未配置用户确认，拒绝应用批量变更")
+        try:
+            approved = self.batch_change_approval(preview)
+        except Exception as exc:
+            raise WorkspaceError("无法获得用户确认；工作区未修改") from exc
+        if approved is not True:
+            raise WorkspaceError("用户拒绝了批量变更；工作区未修改")
+
+        self._recheck_prepared_changes(prepared)
+        applied: list[_PreparedChange] = []
+        try:
+            for change in prepared:
+                self._apply_prepared_change(change)
+                applied.append(change)
+        except WorkspaceError as exc:
+            restore_failed = False
+            for change in reversed(applied):
+                try:
+                    self._restore_prepared_change(change)
+                except WorkspaceError:
+                    restore_failed = True
+            if restore_failed:
+                raise WorkspaceError(
+                    "批量变更应用失败，且无法完整恢复本批次已经变更的文件；"
+                    "请立即检查工作区"
+                ) from exc
+            raise WorkspaceError(
+                "批量变更应用失败，已恢复本批次已经变更的文件"
+            ) from exc
+
+        change_ids: list[int] = []
+        if self.change_journal is not None:
+            for change in prepared:
+                record = self.change_journal.record(
+                    path=change.path,
+                    before_text=change.before_text,
+                    after_text=change.after_text,
+                    diff=change.diff,
+                    replacements=change.replacements,
+                    kind=change.kind,
+                )
+                change_ids.append(record.change_id)
+        return {
+            "ok": True,
+            "approved": True,
+            "paths": tuple(change.path for change in prepared),
+            "change_ids": tuple(change_ids),
+            "creations": preview.creations,
+            "replacements": preview.replacements,
+            "deletions": preview.deletions,
+            "diff": diff,
+        }
+
+    def _normalize_change_set_operations(
+        self,
+        operations: object,
+    ) -> tuple[tuple[ChangeKind, str, Mapping[str, Any]], ...]:
+        """校验批量操作结构、规范化路径，并拒绝同一路径重复操作。"""
+
+        if not isinstance(operations, list):
+            raise WorkspaceError("operations 必须是数组")
+        if not 1 <= len(operations) <= self._MAX_BATCH_CHANGES:
+            raise WorkspaceError(
+                f"operations 必须包含 1 到 {self._MAX_BATCH_CHANGES} 项变更"
+            )
+        required_keys = {
+            ChangeKind.CREATE: {"kind", "path", "content"},
+            ChangeKind.REPLACE: {"kind", "path", "old_text", "new_text"},
+            ChangeKind.DELETE: {"kind", "path"},
+        }
+        allowed_keys = {
+            **required_keys,
+            ChangeKind.REPLACE: required_keys[ChangeKind.REPLACE]
+            | {"expected_replacements"},
+        }
+        normalized: list[tuple[ChangeKind, str, Mapping[str, Any]]] = []
+        seen_paths: set[str] = set()
+        for index, operation in enumerate(operations):
+            if not isinstance(operation, Mapping):
+                raise WorkspaceError(f"operations[{index}] 必须是对象")
+            raw_kind = operation.get("kind")
+            try:
+                kind = ChangeKind(raw_kind)
+            except (TypeError, ValueError) as exc:
+                raise WorkspaceError(
+                    f"operations[{index}].kind 必须是 create、replace 或 delete"
+                ) from exc
+            missing_keys = required_keys[kind] - operation.keys()
+            if missing_keys:
+                missing = ", ".join(sorted(missing_keys))
+                raise WorkspaceError(f"operations[{index}] 缺少字段：{missing}")
+            unexpected_keys = operation.keys() - allowed_keys[kind]
+            if unexpected_keys:
+                unexpected = ", ".join(sorted(str(key) for key in unexpected_keys))
+                raise WorkspaceError(f"operations[{index}] 包含多余字段：{unexpected}")
+            path = operation.get("path")
+            if not isinstance(path, str):
+                raise WorkspaceError(f"operations[{index}].path 必须是字符串")
+            display_path = (
+                self.canonical_new_file_path(path)
+                if kind is ChangeKind.CREATE
+                else self.canonical_file_path(path)
+            )
+            path_key = os.path.normcase(display_path)
+            if path_key in seen_paths:
+                raise WorkspaceError(f"批量变更不能重复操作同一路径：{display_path}")
+            seen_paths.add(path_key)
+            normalized.append((kind, display_path, operation))
+        return tuple(normalized)
+
+    def _prepare_change(
+        self,
+        kind: ChangeKind,
+        path: str,
+        operation: Mapping[str, Any],
+    ) -> _PreparedChange:
+        """构建一项已经完整校验的批量文件变更。"""
+
+        target = self.resolve(path, must_exist=kind is not ChangeKind.CREATE)
+        if kind is ChangeKind.CREATE:
+            content = operation["content"]
+            if not isinstance(content, str) or not content:
+                raise WorkspaceError(f"新文件 {path} 的 content 必须是非空字符串")
+            if "\x00" in content:
+                raise WorkspaceError(f"新文件 {path} 的内容不能包含 NUL 字符")
+            try:
+                content_bytes = content.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise WorkspaceError(
+                    f"新文件 {path} 的 content 不能编码为有效的 UTF-8"
+                ) from exc
+            if len(content_bytes) > self._MAX_FILE_BYTES:
+                raise WorkspaceError(
+                    f"新文件 {path} 超过 {self._MAX_FILE_BYTES} 字节上限"
+                )
+            return _PreparedChange(
+                kind=kind,
+                path=path,
+                target=target,
+                before_text=None,
+                after_text=content,
+                diff=self._creation_diff(path, content),
+                replacements=0,
+                original_bytes=0,
+                updated_bytes=len(content_bytes),
+            )
+
+        before_text, original_bytes = self._read_utf8_text(target, path)
+        if "\x00" in before_text:
+            raise WorkspaceError(f"文件包含 NUL 字符，拒绝批量变更：{path}")
+        if kind is ChangeKind.DELETE:
+            return _PreparedChange(
+                kind=kind,
+                path=path,
+                target=target,
+                before_text=before_text,
+                after_text=None,
+                diff=self._deletion_diff(path, before_text),
+                replacements=0,
+                original_bytes=original_bytes,
+                updated_bytes=0,
+            )
+
+        old_text = operation["old_text"]
+        new_text = operation["new_text"]
+        expected_replacements = operation.get("expected_replacements", 1)
+        if not isinstance(old_text, str) or not old_text:
+            raise WorkspaceError(f"文件 {path} 的 old_text 必须是非空字符串")
+        if not isinstance(new_text, str):
+            raise WorkspaceError(f"文件 {path} 的 new_text 必须是字符串")
+        if "\x00" in old_text or "\x00" in new_text:
+            raise WorkspaceError(f"文件 {path} 的替换文本不能包含 NUL 字符")
+        if old_text == new_text:
+            raise WorkspaceError(f"文件 {path} 的 old_text 和 new_text 不能相同")
+        if not isinstance(expected_replacements, int) or isinstance(
+            expected_replacements, bool
+        ):
+            raise WorkspaceError(
+                f"文件 {path} 的 expected_replacements 必须是整数"
+            )
+        if not 1 <= expected_replacements <= self._MAX_REPLACEMENTS:
+            raise WorkspaceError(
+                f"文件 {path} 的 expected_replacements 必须在 1 到 "
+                f"{self._MAX_REPLACEMENTS} 之间"
+            )
+        actual_replacements = before_text.count(old_text)
+        if actual_replacements != expected_replacements:
+            raise WorkspaceError(
+                f"文件 {path} 的替换次数不符合预期：期望 "
+                f"{expected_replacements} 次，实际 {actual_replacements} 次"
+            )
+        after_text = before_text.replace(old_text, new_text)
+        try:
+            after_bytes = after_text.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise WorkspaceError(
+                f"文件 {path} 的 new_text 不能编码为有效的 UTF-8"
+            ) from exc
+        if len(after_bytes) > self._MAX_FILE_BYTES:
+            raise WorkspaceError(
+                f"文件 {path} 替换后超过 {self._MAX_FILE_BYTES} 字节上限"
+            )
+        return _PreparedChange(
+            kind=kind,
+            path=path,
+            target=target,
+            before_text=before_text,
+            after_text=after_text,
+            diff=self._replacement_diff(path, before_text, after_text),
+            replacements=actual_replacements,
+            original_bytes=original_bytes,
+            updated_bytes=len(after_bytes),
+        )
+
+    def _recheck_prepared_changes(
+        self,
+        changes: tuple[_PreparedChange, ...],
+    ) -> None:
+        """在批量批准后确认每个路径仍保持预览时的状态。"""
+
+        for change in changes:
+            if change.before_text is None:
+                if os.path.lexists(change.target):
+                    raise WorkspaceError(
+                        f"批量变更确认期间目标被创建：{change.path}；工作区未修改"
+                    )
+                continue
+            if not os.path.lexists(change.target) or not change.target.is_file():
+                raise WorkspaceError(
+                    f"批量变更确认期间文件被删除或替换：{change.path}；"
+                    "工作区未修改"
+                )
+            current_text, current_bytes = self._read_utf8_text(
+                change.target,
+                change.path,
+            )
+            if (
+                current_text != change.before_text
+                or current_bytes != change.original_bytes
+            ):
+                raise WorkspaceError(
+                    f"批量变更确认期间文件发生变化：{change.path}；"
+                    "工作区未修改"
+                )
+
+    def _apply_prepared_change(self, change: _PreparedChange) -> None:
+        """提交一项批量变更。"""
+
+        if change.kind is ChangeKind.CREATE:
+            assert change.after_text is not None
+            self._exclusive_write(change.target, change.after_text.encode("utf-8"))
+        elif change.kind is ChangeKind.REPLACE:
+            assert change.after_text is not None
+            self._atomic_write(change.target, change.after_text.encode("utf-8"))
+        else:
+            assert change.before_text is not None
+            self._checked_delete(change.target, change.before_text.encode("utf-8"))
+
+    def _restore_prepared_change(self, change: _PreparedChange) -> None:
+        """把已经提交的一项批量变更恢复到批次开始前。"""
+
+        if change.before_text is None:
+            if os.path.lexists(change.target):
+                assert change.after_text is not None
+                self._checked_delete(
+                    change.target,
+                    change.after_text.encode("utf-8"),
+                )
+            return
+        original_content = change.before_text.encode("utf-8")
+        if change.after_text is None:
+            if os.path.lexists(change.target):
+                raise WorkspaceError(
+                    f"批量恢复期间删除目标被外部重新创建：{change.path}"
+                )
+            self._exclusive_write(change.target, original_content)
+            return
+        if not os.path.lexists(change.target) or not change.target.is_file():
+            raise WorkspaceError(
+                f"批量恢复期间替换目标被外部删除或替换：{change.path}"
+            )
+        current_text, current_bytes = self._read_utf8_text(change.target, change.path)
+        if (
+            current_text != change.after_text
+            or current_bytes != change.updated_bytes
+        ):
+            raise WorkspaceError(
+                f"批量恢复期间替换目标被外部修改：{change.path}"
+            )
+        self._atomic_write(change.target, original_content)
 
     def rollback_changes(
         self,
@@ -1454,7 +1839,7 @@ def build_read_only_registry(workspace: SafeWorkspace) -> ToolRegistry:
 
 
 def build_agent_registry(workspace: SafeWorkspace) -> ToolRegistry:
-    """创建包含受控创建、精确修改与删除能力的 Agent 工具注册表。"""
+    """创建包含受控单项与批量文件变更能力的 Agent 工具注册表。"""
 
     registry = build_read_only_registry(workspace)
     registry.register(
@@ -1551,6 +1936,56 @@ def build_agent_registry(workspace: SafeWorkspace) -> ToolRegistry:
             file_access=ToolFileAccess.DELETE,
             path_argument="path",
             path_normalizer=workspace.canonical_file_path,
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="apply_change_set",
+            description=(
+                "统一预览并应用 1 到 20 项相互独立的文件创建、精确替换或删除。"
+                "replace/delete 目标都必须先读取；同一路径不能在一个批次中出现两次。"
+                "用户只确认一次，失败时会恢复本批次已经应用的变更。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "operations": {
+                        "type": "array",
+                        "description": (
+                            "批量操作。create 需要 kind/path/content；replace 需要 "
+                            "kind/path/old_text/new_text，可选 expected_replacements；"
+                            "delete 只需要 kind/path。"
+                        ),
+                        "minItems": 1,
+                        "maxItems": SafeWorkspace._MAX_BATCH_CHANGES,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "kind": {
+                                    "type": "string",
+                                    "enum": ["create", "replace", "delete"],
+                                },
+                                "path": {"type": "string", "minLength": 1},
+                                "content": {"type": "string", "minLength": 1},
+                                "old_text": {"type": "string", "minLength": 1},
+                                "new_text": {"type": "string"},
+                                "expected_replacements": {
+                                    "type": "integer",
+                                    "default": 1,
+                                    "minimum": 1,
+                                    "maximum": SafeWorkspace._MAX_REPLACEMENTS,
+                                },
+                            },
+                            "required": ["kind", "path"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                "required": ["operations"],
+                "additionalProperties": False,
+            },
+            handler=workspace.apply_change_set,
+            file_access_resolver=workspace.change_set_file_accesses,
         )
     )
     registry.register(

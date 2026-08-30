@@ -231,6 +231,63 @@ class ToolingTests(unittest.TestCase):
         self.assertEqual(snapshot.blocked_write_attempts, 1)
         self.assertTrue(snapshot.has_unverified_changes)
 
+    def test_batch_access_resolver_checks_and_records_every_path(self) -> None:
+        applied: list[object] = []
+        registry = ToolRegistry()
+        registry.register(
+            ToolDefinition(
+                "read_file",
+                "读取",
+                {"type": "object"},
+                lambda path: {"ok": True, "path": path},
+                file_access=ToolFileAccess.READ,
+                path_argument="path",
+            )
+        )
+
+        def resolve_accesses(
+            arguments: dict[str, object],
+        ) -> tuple[tuple[ToolFileAccess, str], ...]:
+            operations = arguments["operations"]
+            assert isinstance(operations, list)
+            return (
+                (ToolFileAccess.WRITE, "old.py"),
+                (ToolFileAccess.CREATE, "new.py"),
+            )
+
+        registry.register(
+            ToolDefinition(
+                "apply_change_set",
+                "批量变更",
+                {"type": "object"},
+                lambda operations: applied.append(operations) or {"ok": True},
+                file_access_resolver=resolve_accesses,  # type: ignore[arg-type]
+            )
+        )
+        arguments = {"operations": [{"kind": "replace"}]}
+
+        blocked = json.loads(
+            registry.execute(
+                ToolCall(id="blocked", name="apply_change_set", arguments=arguments)
+            )
+        )
+        registry.execute(
+            ToolCall(id="read", name="read_file", arguments={"path": "old.py"})
+        )
+        allowed = json.loads(
+            registry.execute(
+                ToolCall(id="allowed", name="apply_change_set", arguments=arguments)
+            )
+        )
+
+        self.assertFalse(blocked["ok"])
+        self.assertTrue(allowed["ok"])
+        self.assertEqual(applied, [arguments["operations"]])
+        snapshot = registry.state.snapshot()
+        self.assertEqual(snapshot.modified_files, ("new.py", "old.py"))
+        self.assertEqual(snapshot.blocked_write_attempts, 1)
+        self.assertTrue(snapshot.has_unverified_changes)
+
     def test_file_access_metadata_must_be_complete(self) -> None:
         with self.assertRaisesRegex(ToolRegistrationError, "同时配置"):
             ToolDefinition(
@@ -240,6 +297,35 @@ class ToolingTests(unittest.TestCase):
                 lambda path: path,
                 file_access=ToolFileAccess.READ,
             )
+        with self.assertRaisesRegex(ToolRegistrationError, "不能同时配置"):
+            ToolDefinition(
+                "batch",
+                "批量",
+                {"type": "object"},
+                lambda: None,
+                file_access=ToolFileAccess.WRITE,
+                path_argument="path",
+                file_access_resolver=lambda _arguments: (),
+            )
+
+    def test_batch_access_resolver_must_return_at_least_one_valid_item(self) -> None:
+        registry = ToolRegistry()
+        registry.register(
+            ToolDefinition(
+                "batch",
+                "批量",
+                {"type": "object"},
+                lambda: {"ok": True},
+                file_access_resolver=lambda _arguments: (),
+            )
+        )
+
+        result = json.loads(
+            registry.execute(ToolCall(id="batch", name="batch", arguments={}))
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertIn("至少需要返回一项", result["error"]["message"])
 
     def test_test_runner_updates_verification_state(self) -> None:
         registry = ToolRegistry()

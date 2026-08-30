@@ -10,6 +10,7 @@ from unittest.mock import patch
 from safe_patch_agent.changes import ChangeJournal, ChangeKind
 from safe_patch_agent.messages import ToolCall
 from safe_patch_agent.workspace import (
+    BatchChangePreview,
     CreationPreview,
     DeletionPreview,
     ReplacementPreview,
@@ -662,6 +663,259 @@ class WorkspaceTests(unittest.TestCase):
 
         self.assertEqual(target.read_text(encoding="utf-8"), "external\n")
 
+    def test_change_set_previews_and_applies_create_replace_delete_once(self) -> None:
+        replace_target = self.root / "replace.py"
+        delete_target = self.root / "obsolete.py"
+        replace_target.write_text("old\n", encoding="utf-8")
+        delete_target.write_text("obsolete\n", encoding="utf-8")
+        previews: list[BatchChangePreview] = []
+        journal = ChangeJournal()
+        workspace = SafeWorkspace(
+            self.root,
+            batch_change_approval=lambda preview: previews.append(preview) is None,
+            change_journal=journal,
+        )
+        operations = [
+            {"kind": "create", "path": "new.py", "content": "created\n"},
+            {
+                "kind": "replace",
+                "path": "replace.py",
+                "old_text": "old",
+                "new_text": "updated",
+            },
+            {"kind": "delete", "path": "obsolete.py"},
+        ]
+
+        result = workspace.apply_change_set(operations)
+
+        self.assertEqual((self.root / "new.py").read_text(encoding="utf-8"), "created\n")
+        self.assertEqual(replace_target.read_text(encoding="utf-8"), "updated\n")
+        self.assertFalse(delete_target.exists())
+        self.assertEqual(result["change_ids"], (1, 2, 3))
+        self.assertEqual(result["creations"], 1)
+        self.assertEqual(result["replacements"], 1)
+        self.assertEqual(result["deletions"], 1)
+        self.assertEqual(len(previews), 1)
+        self.assertEqual(previews[0].paths, ("new.py", "replace.py", "obsolete.py"))
+        self.assertIn("+++ b/new.py", previews[0].diff)
+        self.assertIn("--- a/replace.py", previews[0].diff)
+        self.assertIn("+++ /dev/null", previews[0].diff)
+        self.assertEqual(
+            tuple(summary.kind for summary in journal.summaries()),
+            (ChangeKind.CREATE, ChangeKind.REPLACE, ChangeKind.DELETE),
+        )
+
+    def test_change_set_requires_approval_and_rejects_invalid_operations(self) -> None:
+        target = self.root / "replace.py"
+        target.write_text("old\n", encoding="utf-8")
+        operations = [
+            {
+                "kind": "replace",
+                "path": "replace.py",
+                "old_text": "old",
+                "new_text": "new",
+            }
+        ]
+
+        with self.assertRaisesRegex(WorkspaceError, "未配置用户确认"):
+            self.workspace.apply_change_set(operations)
+        rejected = SafeWorkspace(
+            self.root,
+            batch_change_approval=lambda _preview: False,
+        )
+        with self.assertRaisesRegex(WorkspaceError, "用户拒绝"):
+            rejected.apply_change_set(operations)
+        with self.assertRaisesRegex(WorkspaceError, "1 到 20"):
+            rejected.apply_change_set([])
+        with self.assertRaisesRegex(WorkspaceError, "不能重复操作"):
+            rejected.apply_change_set([operations[0], operations[0]])
+        with self.assertRaisesRegex(WorkspaceError, "缺少字段"):
+            rejected.apply_change_set(
+                [{"kind": "create", "path": "new.py"}]
+            )
+        with self.assertRaisesRegex(WorkspaceError, "多余字段"):
+            rejected.apply_change_set(
+                [{"kind": "delete", "path": "replace.py", "content": "bad"}]
+            )
+
+        self.assertEqual(target.read_text(encoding="utf-8"), "old\n")
+
+    def test_change_set_checks_all_journal_capacity_before_approval(self) -> None:
+        first = self.root / "first.py"
+        second = self.root / "second.py"
+        first.write_text("old\n", encoding="utf-8")
+        second.write_text("old\n", encoding="utf-8")
+        approval_called = False
+
+        def approve(_preview: BatchChangePreview) -> bool:
+            nonlocal approval_called
+            approval_called = True
+            return True
+
+        workspace = SafeWorkspace(
+            self.root,
+            batch_change_approval=approve,
+            change_journal=ChangeJournal(max_records=1),
+        )
+        operations = [
+            {
+                "kind": "replace",
+                "path": path,
+                "old_text": "old",
+                "new_text": "new",
+            }
+            for path in ("first.py", "second.py")
+        ]
+
+        with self.assertRaisesRegex(WorkspaceError, "1 条上限"):
+            workspace.apply_change_set(operations)
+
+        self.assertFalse(approval_called)
+        self.assertEqual(first.read_text(encoding="utf-8"), "old\n")
+        self.assertEqual(second.read_text(encoding="utf-8"), "old\n")
+
+    def test_change_set_requires_the_combined_diff_to_be_fully_previewable(self) -> None:
+        target = self.root / "replace.py"
+        target.write_text("old\n", encoding="utf-8")
+        approval_called = False
+
+        def approve(_preview: BatchChangePreview) -> bool:
+            nonlocal approval_called
+            approval_called = True
+            return True
+
+        workspace = SafeWorkspace(
+            self.root,
+            batch_change_approval=approve,
+        )
+        operations = [
+            {"kind": "create", "path": "new.py", "content": "created\n"},
+            {
+                "kind": "replace",
+                "path": "replace.py",
+                "old_text": "old",
+                "new_text": "updated",
+            },
+        ]
+
+        with (
+            patch.object(SafeWorkspace, "_MAX_PATCH_PREVIEW_CHARS", 20),
+            self.assertRaisesRegex(WorkspaceError, "批量变更预览超过"),
+        ):
+            workspace.apply_change_set(operations)
+
+        self.assertFalse(approval_called)
+        self.assertFalse((self.root / "new.py").exists())
+        self.assertEqual(target.read_text(encoding="utf-8"), "old\n")
+
+    def test_change_set_rechecks_every_path_after_approval(self) -> None:
+        replace_target = self.root / "replace.py"
+        delete_target = self.root / "obsolete.py"
+        replace_target.write_text("old\n", encoding="utf-8")
+        delete_target.write_text("obsolete\n", encoding="utf-8")
+
+        def change_during_approval(_preview: BatchChangePreview) -> bool:
+            replace_target.write_text("external\n", encoding="utf-8")
+            return True
+
+        workspace = SafeWorkspace(
+            self.root,
+            batch_change_approval=change_during_approval,
+        )
+        operations = [
+            {"kind": "create", "path": "new.py", "content": "created\n"},
+            {
+                "kind": "replace",
+                "path": "replace.py",
+                "old_text": "old",
+                "new_text": "updated",
+            },
+            {"kind": "delete", "path": "obsolete.py"},
+        ]
+
+        with self.assertRaisesRegex(WorkspaceError, "确认期间文件发生变化"):
+            workspace.apply_change_set(operations)
+
+        self.assertFalse((self.root / "new.py").exists())
+        self.assertEqual(replace_target.read_text(encoding="utf-8"), "external\n")
+        self.assertEqual(delete_target.read_text(encoding="utf-8"), "obsolete\n")
+
+    def test_change_set_restores_applied_files_when_later_change_fails(self) -> None:
+        replace_target = self.root / "replace.py"
+        delete_target = self.root / "obsolete.py"
+        replace_target.write_text("old\n", encoding="utf-8")
+        delete_target.write_text("obsolete\n", encoding="utf-8")
+        journal = ChangeJournal()
+        workspace = SafeWorkspace(
+            self.root,
+            batch_change_approval=lambda _preview: True,
+            change_journal=journal,
+        )
+        operations = [
+            {"kind": "create", "path": "new.py", "content": "created\n"},
+            {
+                "kind": "replace",
+                "path": "replace.py",
+                "old_text": "old",
+                "new_text": "updated",
+            },
+            {"kind": "delete", "path": "obsolete.py"},
+        ]
+        checked_delete = workspace._checked_delete
+
+        def fail_obsolete_delete(target: Path, content: bytes) -> None:
+            if target == delete_target:
+                raise WorkspaceError("模拟最后一项失败")
+            checked_delete(target, content)
+
+        with (
+            patch.object(
+                workspace,
+                "_checked_delete",
+                side_effect=fail_obsolete_delete,
+            ),
+            self.assertRaisesRegex(WorkspaceError, "已恢复本批次"),
+        ):
+            workspace.apply_change_set(operations)
+
+        self.assertFalse((self.root / "new.py").exists())
+        self.assertEqual(replace_target.read_text(encoding="utf-8"), "old\n")
+        self.assertEqual(delete_target.read_text(encoding="utf-8"), "obsolete\n")
+        self.assertEqual(journal.record_count, 0)
+
+    def test_change_set_records_integrate_with_full_rollback(self) -> None:
+        replace_target = self.root / "replace.py"
+        delete_target = self.root / "obsolete.py"
+        replace_target.write_text("old\n", encoding="utf-8")
+        delete_target.write_text("obsolete\n", encoding="utf-8")
+        journal = ChangeJournal()
+        workspace = SafeWorkspace(
+            self.root,
+            batch_change_approval=lambda _preview: True,
+            change_journal=journal,
+            rollback_approval=lambda _preview: True,
+        )
+        workspace.apply_change_set(
+            [
+                {"kind": "create", "path": "new.py", "content": "created\n"},
+                {
+                    "kind": "replace",
+                    "path": "replace.py",
+                    "old_text": "old",
+                    "new_text": "updated",
+                },
+                {"kind": "delete", "path": "obsolete.py"},
+            ]
+        )
+
+        result = workspace.rollback_changes("all")
+
+        self.assertFalse((self.root / "new.py").exists())
+        self.assertEqual(replace_target.read_text(encoding="utf-8"), "old\n")
+        self.assertEqual(delete_target.read_text(encoding="utf-8"), "obsolete\n")
+        self.assertEqual(result["change_ids"], (3, 2, 1))
+        self.assertTrue(all(item.rolled_back for item in journal.summaries()))
+
     def test_rollback_latest_restores_content_after_confirmation(self) -> None:
         target = self.root / "replace.py"
         target.write_text("old\n", encoding="utf-8")
@@ -952,6 +1206,8 @@ class WorkspaceTests(unittest.TestCase):
             SafeWorkspace(self.root, creation_approval=True)  # type: ignore[arg-type]
         with self.assertRaisesRegex(WorkspaceError, "deletion_approval"):
             SafeWorkspace(self.root, deletion_approval=True)  # type: ignore[arg-type]
+        with self.assertRaisesRegex(WorkspaceError, "batch_change_approval"):
+            SafeWorkspace(self.root, batch_change_approval=True)  # type: ignore[arg-type]
 
     def test_replace_text_honors_rejection(self) -> None:
         target = self.root / "replace.py"
@@ -1226,6 +1482,63 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(snapshot.modified_files, ("obsolete.py",))
         self.assertTrue(snapshot.has_unverified_changes)
 
+    def test_change_set_registry_checks_reads_and_records_all_paths(self) -> None:
+        replace_target = self.root / "replace.py"
+        delete_target = self.root / "obsolete.py"
+        replace_target.write_text("old\n", encoding="utf-8")
+        delete_target.write_text("obsolete\n", encoding="utf-8")
+        workspace = SafeWorkspace(
+            self.root,
+            batch_change_approval=lambda _preview: True,
+        )
+        registry = build_agent_registry(workspace)
+        arguments = {
+            "operations": [
+                {"kind": "create", "path": "new.py", "content": "created\n"},
+                {
+                    "kind": "replace",
+                    "path": "replace.py",
+                    "old_text": "old",
+                    "new_text": "updated",
+                },
+                {"kind": "delete", "path": "obsolete.py"},
+            ]
+        }
+
+        blocked = json.loads(
+            registry.execute(
+                ToolCall(
+                    id="blocked-batch",
+                    name="apply_change_set",
+                    arguments=arguments,
+                )
+            )
+        )
+        for path in ("replace.py", "obsolete.py"):
+            registry.execute(
+                ToolCall(id=f"read-{path}", name="read_file", arguments={"path": path})
+            )
+        applied = json.loads(
+            registry.execute(
+                ToolCall(
+                    id="batch",
+                    name="apply_change_set",
+                    arguments=arguments,
+                )
+            )
+        )
+
+        self.assertFalse(blocked["ok"])
+        self.assertTrue(applied["ok"])
+        snapshot = registry.state.snapshot()
+        self.assertEqual(snapshot.read_files, ("obsolete.py", "replace.py"))
+        self.assertEqual(
+            snapshot.modified_files,
+            ("new.py", "obsolete.py", "replace.py"),
+        )
+        self.assertEqual(snapshot.blocked_write_attempts, 1)
+        self.assertTrue(snapshot.has_unverified_changes)
+
     def test_agent_registry_exposes_replace_text_schema(self) -> None:
         registry = build_agent_registry(self.workspace)
         tool_names = {schema["function"]["name"] for schema in registry.schemas()}
@@ -1244,6 +1557,11 @@ class WorkspaceTests(unittest.TestCase):
             for schema in registry.schemas()
             if schema["function"]["name"] == "delete_file"
         )["function"]["parameters"]
+        batch_schema = next(
+            schema
+            for schema in registry.schemas()
+            if schema["function"]["name"] == "apply_change_set"
+        )["function"]["parameters"]
 
         self.assertEqual(
             tool_names,
@@ -1254,6 +1572,7 @@ class WorkspaceTests(unittest.TestCase):
                 "replace_text",
                 "create_file",
                 "delete_file",
+                "apply_change_set",
                 "run_tests",
             },
         )
@@ -1268,6 +1587,8 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(create_schema["required"], ["path", "content"])
         self.assertEqual(create_schema["properties"]["content"]["minLength"], 1)
         self.assertEqual(delete_schema["required"], ["path"])
+        self.assertEqual(batch_schema["required"], ["operations"])
+        self.assertEqual(batch_schema["properties"]["operations"]["maxItems"], 20)
 
     def test_run_tests_uses_fixed_command_and_sanitized_environment(self) -> None:
         with (

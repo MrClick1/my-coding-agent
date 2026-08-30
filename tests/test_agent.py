@@ -187,6 +187,7 @@ class AgentTests(unittest.TestCase):
                 "replace_text",
                 "create_file",
                 "delete_file",
+                "apply_change_set",
                 "run_tests",
                 "search_code",
             },
@@ -396,6 +397,88 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(result.answer, "删除完成。")
         self.assertEqual(result.state.read_files, ("obsolete.py",))
         self.assertEqual(result.state.modified_files, ("obsolete.py",))
+        self.assertEqual(result.state.test_runs, 1)
+        self.assertFalse(result.state.has_unverified_changes)
+
+    def test_agent_can_apply_multi_file_change_set_then_runs_tests(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            replace_target = root / "replace.py"
+            delete_target = root / "obsolete.py"
+            replace_target.write_text("old\n", encoding="utf-8")
+            delete_target.write_text("obsolete\n", encoding="utf-8")
+            workspace = SafeWorkspace(
+                root,
+                batch_change_approval=lambda _preview: True,
+            )
+            registry = build_agent_registry(workspace)
+            read_replace = ToolCall(
+                id="read-replace",
+                name="read_file",
+                arguments={"path": "replace.py"},
+            )
+            read_delete = ToolCall(
+                id="read-delete",
+                name="read_file",
+                arguments={"path": "obsolete.py"},
+            )
+            batch_call = ToolCall(
+                id="batch",
+                name="apply_change_set",
+                arguments={
+                    "operations": [
+                        {
+                            "kind": "create",
+                            "path": "new.py",
+                            "content": "created\n",
+                        },
+                        {
+                            "kind": "replace",
+                            "path": "replace.py",
+                            "old_text": "old",
+                            "new_text": "updated",
+                        },
+                        {"kind": "delete", "path": "obsolete.py"},
+                    ]
+                },
+            )
+            test_call = ToolCall(id="tests", name="run_tests", arguments={})
+            client = ScriptedClient(
+                [
+                    ChatCompletion(
+                        ChatMessage.assistant(None, (read_replace, read_delete)),
+                        "tool_calls",
+                    ),
+                    ChatCompletion(
+                        ChatMessage.assistant(None, (batch_call,)),
+                        "tool_calls",
+                    ),
+                    ChatCompletion(
+                        ChatMessage.assistant(None, (test_call,)),
+                        "tool_calls",
+                    ),
+                    ChatCompletion(ChatMessage.assistant("批量变更完成。"), "stop"),
+                ]
+            )
+
+            with patch("safe_patch_agent.workspace.subprocess.run") as run:
+                run.return_value.returncode = 0
+                run.return_value.stdout = "1 passed\n"
+                result = CodingAgent(client, registry).run("批量更新三个文件")
+            created_content = (root / "new.py").read_text(encoding="utf-8")
+            replaced_content = replace_target.read_text(encoding="utf-8")
+            deleted = not delete_target.exists()
+
+        self.assertEqual(created_content, "created\n")
+        self.assertEqual(replaced_content, "updated\n")
+        self.assertTrue(deleted)
+        self.assertEqual(result.answer, "批量变更完成。")
+        self.assertEqual(result.tool_calls, 4)
+        self.assertEqual(result.state.read_files, ("obsolete.py", "replace.py"))
+        self.assertEqual(
+            result.state.modified_files,
+            ("new.py", "obsolete.py", "replace.py"),
+        )
         self.assertEqual(result.state.test_runs, 1)
         self.assertFalse(result.state.has_unverified_changes)
 
