@@ -39,6 +39,18 @@ ReplacementApproval = Callable[[ReplacementPreview], bool]
 
 
 @dataclass(frozen=True)
+class CreationPreview:
+    """等待用户确认的一次新文件创建预览。"""
+
+    path: str
+    diff: str
+    updated_bytes: int
+
+
+CreationApproval = Callable[[CreationPreview], bool]
+
+
+@dataclass(frozen=True)
 class RollbackPreview:
     """等待用户确认的一次会话修改回滚预览。"""
 
@@ -47,6 +59,7 @@ class RollbackPreview:
     diff: str
     original_bytes: int
     updated_bytes: int
+    deleted_paths: tuple[str, ...] = ()
 
 
 RollbackApproval = Callable[[RollbackPreview], bool]
@@ -125,6 +138,7 @@ class SafeWorkspace:
         root: Path,
         *,
         replacement_approval: ReplacementApproval | None = None,
+        creation_approval: CreationApproval | None = None,
         change_journal: ChangeJournal | None = None,
         rollback_approval: RollbackApproval | None = None,
     ) -> None:
@@ -135,10 +149,13 @@ class SafeWorkspace:
             raise WorkspaceError(f"工作区路径不是目录：{resolved_root}")
         if replacement_approval is not None and not callable(replacement_approval):
             raise WorkspaceError("replacement_approval 必须是可调用对象")
+        if creation_approval is not None and not callable(creation_approval):
+            raise WorkspaceError("creation_approval 必须是可调用对象")
         if rollback_approval is not None and not callable(rollback_approval):
             raise WorkspaceError("rollback_approval 必须是可调用对象")
         self.root = resolved_root
         self.replacement_approval = replacement_approval
+        self.creation_approval = creation_approval
         self.change_journal = change_journal
         self.rollback_approval = rollback_approval
 
@@ -175,6 +192,16 @@ class SafeWorkspace:
         target = self.resolve(path)
         if not target.is_file():
             raise WorkspaceError(f"路径不是文件：{path}")
+        return self.display_path(target)
+
+    def canonical_new_file_path(self, path: str) -> str:
+        """返回父目录存在、目标尚不存在的规范化相对路径。"""
+
+        target = self.resolve(path, must_exist=False)
+        if os.path.lexists(target):
+            raise WorkspaceError(f"创建目标已经存在：{path}")
+        if not target.parent.exists() or not target.parent.is_dir():
+            raise WorkspaceError(f"创建目标的父目录不存在：{path}")
         return self.display_path(target)
 
     def list_files(self, path: str = ".", max_results: int = 200) -> dict[str, Any]:
@@ -532,6 +559,71 @@ class SafeWorkspace:
             "updated_bytes": len(updated_bytes),
         }
 
+    def create_file(self, path: str, content: str) -> dict[str, Any]:
+        """完整预览并确认后，以排他方式创建新的 UTF-8 文件。"""
+
+        if not isinstance(content, str) or not content:
+            raise WorkspaceError("content 必须是非空字符串")
+        if "\x00" in content:
+            raise WorkspaceError("新文件内容不能包含 NUL 字符")
+        display_path = self.canonical_new_file_path(path)
+        target = self.resolve(display_path, must_exist=False)
+        try:
+            content_bytes = content.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise WorkspaceError("content 不能编码为有效的 UTF-8") from exc
+        if len(content_bytes) > self._MAX_FILE_BYTES:
+            raise WorkspaceError(
+                f"新文件超过 {self._MAX_FILE_BYTES} 字节上限；文件未创建"
+            )
+
+        diff = self._creation_diff(display_path, content)
+        if len(diff) > self._MAX_PATCH_PREVIEW_CHARS:
+            raise WorkspaceError(
+                "创建预览超过 "
+                f"{self._MAX_PATCH_PREVIEW_CHARS} 字符上限，无法完整展示；文件未创建"
+            )
+        if self.change_journal is not None:
+            try:
+                self.change_journal.ensure_can_record(None, content)
+            except ChangeJournalError as exc:
+                raise WorkspaceError(str(exc).replace("文件未修改", "文件未创建")) from exc
+        preview = CreationPreview(
+            path=display_path,
+            diff=diff,
+            updated_bytes=len(content_bytes),
+        )
+        if self.creation_approval is None:
+            raise WorkspaceError("未配置用户确认，拒绝创建文件")
+        try:
+            approved = self.creation_approval(preview)
+        except Exception as exc:
+            raise WorkspaceError("无法获得用户确认；文件未创建") from exc
+        if approved is not True:
+            raise WorkspaceError("用户拒绝了创建；文件未创建")
+        if os.path.lexists(target):
+            raise WorkspaceError(
+                "目标在确认期间被其他操作创建；为避免覆盖，已取消创建"
+            )
+
+        self._exclusive_write(target, content_bytes)
+        change_id: int | None = None
+        if self.change_journal is not None:
+            change_id = self.change_journal.record_creation(
+                path=display_path,
+                after_text=content,
+                diff=diff,
+            ).change_id
+        return {
+            "ok": True,
+            "path": display_path,
+            "approved": True,
+            "created": True,
+            "change_id": change_id,
+            "diff": diff,
+            "updated_bytes": len(content_bytes),
+        }
+
     def rollback_changes(
         self,
         target: int | str | None = None,
@@ -559,7 +651,7 @@ class SafeWorkspace:
             current_texts[record.path] = text
             current_bytes[record.path] = byte_count
 
-        restored_texts = dict(current_texts)
+        restored_texts: dict[str, str | None] = dict(current_texts)
         for record in records:
             if restored_texts[record.path] != record.after_text:
                 raise WorkspaceError(
@@ -568,10 +660,15 @@ class SafeWorkspace:
                 )
             restored_texts[record.path] = record.before_text
 
-        diffs = [
-            self._replacement_diff(path, current_texts[path], restored_texts[path])
-            for path in sorted(restored_texts, key=str.casefold)
-        ]
+        diffs = []
+        for path in sorted(restored_texts, key=str.casefold):
+            restored = restored_texts[path]
+            if restored is None:
+                diffs.append(self._deletion_diff(path, current_texts[path]))
+            else:
+                diffs.append(
+                    self._replacement_diff(path, current_texts[path], restored)
+                )
         diff = "".join(diffs)
         if len(diff) > self._MAX_PATCH_PREVIEW_CHARS:
             raise WorkspaceError(
@@ -579,14 +676,23 @@ class SafeWorkspace:
                 f"{self._MAX_PATCH_PREVIEW_CHARS} 字符上限，无法完整展示；文件未修改"
             )
         encoded_restored = {
-            path: text.encode("utf-8") for path, text in restored_texts.items()
+            path: text.encode("utf-8")
+            for path, text in restored_texts.items()
+            if text is not None
         }
+        deleted_paths = tuple(
+            sorted(
+                (path for path, text in restored_texts.items() if text is None),
+                key=str.casefold,
+            )
+        )
         preview = RollbackPreview(
             change_ids=tuple(record.change_id for record in records),
             paths=tuple(sorted(restored_texts, key=str.casefold)),
             diff=diff,
             original_bytes=sum(current_bytes.values()),
             updated_bytes=sum(len(content) for content in encoded_restored.values()),
+            deleted_paths=deleted_paths,
         )
         if self.rollback_approval is None:
             raise WorkspaceError("未配置用户确认，拒绝回滚文件")
@@ -608,16 +714,25 @@ class SafeWorkspace:
         written_paths: list[str] = []
         try:
             for path in sorted(targets, key=str.casefold):
-                self._atomic_write(targets[path], encoded_restored[path])
+                if restored_texts[path] is None:
+                    try:
+                        targets[path].unlink()
+                    except OSError as exc:
+                        raise WorkspaceError(
+                            f"无法安全删除创建文件：{path}"
+                        ) from exc
+                else:
+                    self._atomic_write(targets[path], encoded_restored[path])
                 written_paths.append(path)
         except WorkspaceError as exc:
             restore_failed = False
             for path in reversed(written_paths):
                 try:
-                    self._atomic_write(
-                        targets[path],
-                        current_texts[path].encode("utf-8"),
-                    )
+                    original_content = current_texts[path].encode("utf-8")
+                    if targets[path].exists():
+                        self._atomic_write(targets[path], original_content)
+                    else:
+                        self._exclusive_write(targets[path], original_content)
                 except WorkspaceError:
                     restore_failed = True
             if restore_failed:
@@ -632,6 +747,7 @@ class SafeWorkspace:
             "ok": True,
             "change_ids": tuple(record.change_id for record in records),
             "paths": tuple(sorted(restored_texts, key=str.casefold)),
+            "deleted_paths": deleted_paths,
             "diff": diff,
         }
 
@@ -639,11 +755,51 @@ class SafeWorkspace:
     def _replacement_diff(path: str, original_text: str, updated_text: str) -> str:
         """创建适合终端完整展示的 unified diff。"""
 
+        return SafeWorkspace._unified_diff(
+            original_text,
+            updated_text,
+            fromfile=f"a/{path}",
+            tofile=f"b/{path}",
+        )
+
+    @staticmethod
+    def _creation_diff(path: str, content: str) -> str:
+        """创建从不存在状态到完整新文件的 unified diff。"""
+
+        return SafeWorkspace._unified_diff(
+            "",
+            content,
+            fromfile="/dev/null",
+            tofile=f"b/{path}",
+        )
+
+    @staticmethod
+    def _deletion_diff(path: str, content: str) -> str:
+        """创建从现有文件到不存在状态的 unified diff。"""
+
+        diff = SafeWorkspace._unified_diff(
+            content,
+            "",
+            fromfile=f"a/{path}",
+            tofile="/dev/null",
+        )
+        return diff or f"--- a/{path}\n+++ /dev/null\n"
+
+    @staticmethod
+    def _unified_diff(
+        original_text: str,
+        updated_text: str,
+        *,
+        fromfile: str,
+        tofile: str,
+    ) -> str:
+        """按指定文件头创建完整且可见的 UTF-8 unified diff。"""
+
         raw_lines = difflib.unified_diff(
             original_text.splitlines(keepends=True),
             updated_text.splitlines(keepends=True),
-            fromfile=f"a/{path}",
-            tofile=f"b/{path}",
+            fromfile=fromfile,
+            tofile=tofile,
             lineterm="\n",
         )
         visible_lines: list[str] = []
@@ -778,6 +934,40 @@ class SafeWorkspace:
             temporary_path = None
         except OSError as exc:
             raise WorkspaceError(f"无法安全写入文件：{target.name}") from exc
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            if temporary_path is not None:
+                try:
+                    temporary_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _exclusive_write(target: Path, content: bytes) -> None:
+        """先完整写入同目录临时文件，再以排他硬链接发布新文件。"""
+
+        descriptor: int | None = None
+        temporary_path: Path | None = None
+        try:
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=f".{target.name}.",
+                suffix=".tmp",
+                dir=target.parent,
+            )
+            temporary_path = Path(temporary_name)
+            with os.fdopen(descriptor, "wb") as file:
+                descriptor = None
+                file.write(content)
+                file.flush()
+                os.fsync(file.fileno())
+            os.link(temporary_path, target)
+        except FileExistsError as exc:
+            raise WorkspaceError(
+                f"目标文件已经存在，拒绝覆盖：{target.name}"
+            ) from exc
+        except OSError as exc:
+            raise WorkspaceError(f"无法安全创建文件：{target.name}") from exc
         finally:
             if descriptor is not None:
                 os.close(descriptor)
@@ -1054,7 +1244,7 @@ def build_read_only_registry(workspace: SafeWorkspace) -> ToolRegistry:
 
 
 def build_agent_registry(workspace: SafeWorkspace) -> ToolRegistry:
-    """创建包含受控精确修改能力的 Agent 工具注册表。"""
+    """创建包含受控精确修改与文件创建能力的 Agent 工具注册表。"""
 
     registry = build_read_only_registry(workspace)
     registry.register(
@@ -1096,6 +1286,36 @@ def build_agent_registry(workspace: SafeWorkspace) -> ToolRegistry:
             file_access=ToolFileAccess.WRITE,
             path_argument="path",
             path_normalizer=workspace.canonical_file_path,
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="create_file",
+            description=(
+                "在父目录已经存在时创建新的 UTF-8 文件。目标必须尚不存在；"
+                "写入前会向用户展示完整新增 diff 并要求确认。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "要创建的工作区相对文件路径。",
+                        "minLength": 1,
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "新文件的完整非空 UTF-8 文本内容。",
+                        "minLength": 1,
+                    },
+                },
+                "required": ["path", "content"],
+                "additionalProperties": False,
+            },
+            handler=workspace.create_file,
+            file_access=ToolFileAccess.CREATE,
+            path_argument="path",
+            path_normalizer=workspace.canonical_new_file_path,
         )
     )
     registry.register(

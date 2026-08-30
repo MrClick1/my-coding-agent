@@ -1,7 +1,7 @@
 import hashlib
 import unittest
 
-from safe_patch_agent.changes import ChangeJournal, ChangeJournalError
+from safe_patch_agent.changes import ChangeJournal, ChangeJournalError, ChangeKind
 
 
 class ChangeJournalTests(unittest.TestCase):
@@ -29,6 +29,23 @@ class ChangeJournalTests(unittest.TestCase):
         )
         self.assertFalse(summary.rolled_back)
         self.assertIsNone(summary.test_passed)
+        self.assertIs(summary.kind, ChangeKind.REPLACE)
+
+    def test_creation_record_represents_missing_previous_file(self) -> None:
+        journal = ChangeJournal()
+
+        record = journal.record_creation(
+            path="new.py",
+            after_text="value = 1\n",
+            diff="+value = 1\n",
+        )
+        summary = journal.summaries()[0]
+
+        self.assertIs(record.kind, ChangeKind.CREATE)
+        self.assertIsNone(record.before_text)
+        self.assertIsNone(summary.before_sha256)
+        self.assertEqual(record.original_bytes, 0)
+        self.assertEqual(record.updated_bytes, len(b"value = 1\n"))
 
     def test_latest_test_result_updates_all_active_changes(self) -> None:
         journal = ChangeJournal()

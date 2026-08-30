@@ -16,11 +16,17 @@ from safe_patch_agent.cli import (
     format_change_log,
     main,
     parse_rollback_target,
+    request_creation_approval,
     request_replacement_approval,
     request_rollback_approval,
     run_chat,
 )
-from safe_patch_agent.workspace import ReplacementPreview, RollbackPreview, SafeWorkspace
+from safe_patch_agent.workspace import (
+    CreationPreview,
+    ReplacementPreview,
+    RollbackPreview,
+    SafeWorkspace,
+)
 
 
 class InteractiveStringIO(StringIO):
@@ -151,6 +157,38 @@ class CLITests(unittest.TestCase):
         self.assertFalse(approved)
         self.assertIn("不是交互式终端", output.getvalue())
 
+    def test_creation_approval_shows_full_diff_and_requires_explicit_yes(self) -> None:
+        preview = CreationPreview(
+            path="src/new.py",
+            diff="--- a/src/new.py\n+++ b/src/new.py\n+value = 1\n",
+            updated_bytes=10,
+        )
+        output = StringIO()
+
+        approved = request_creation_approval(
+            preview,
+            input_stream=InteractiveStringIO("yes\n"),
+            output_stream=output,
+        )
+
+        self.assertTrue(approved)
+        self.assertIn("SafePatch 新文件预览", output.getvalue())
+        self.assertIn("src/new.py", output.getvalue())
+        self.assertIn("+value = 1", output.getvalue())
+
+    def test_non_interactive_input_cannot_approve_creation(self) -> None:
+        preview = CreationPreview("new.py", "+new\n", 4)
+        output = StringIO()
+
+        approved = request_creation_approval(
+            preview,
+            input_stream=StringIO("yes\n"),
+            output_stream=output,
+        )
+
+        self.assertFalse(approved)
+        self.assertIn("不是交互式终端", output.getvalue())
+
     def test_rollback_approval_shows_ids_paths_and_reverse_diff(self) -> None:
         preview = RollbackPreview(
             change_ids=(2, 1),
@@ -158,6 +196,7 @@ class CLITests(unittest.TestCase):
             diff="--- a/demo.py\n+++ b/demo.py\n-new\n+old\n",
             original_bytes=4,
             updated_bytes=4,
+            deleted_paths=("demo.py",),
         )
         output = StringIO()
 
@@ -171,6 +210,7 @@ class CLITests(unittest.TestCase):
         self.assertIn("SafePatch 回滚预览", output.getvalue())
         self.assertIn("#2, #1", output.getvalue())
         self.assertIn("-new\n+old", output.getvalue())
+        self.assertIn("将删除本会话创建的文件：demo.py", output.getvalue())
 
     def test_change_log_and_rollback_target_formatting(self) -> None:
         journal = ChangeJournal()
@@ -188,10 +228,19 @@ class CLITests(unittest.TestCase):
         journal.mark_rolled_back((record,))
         rolled_back = format_change_log(journal)
 
-        self.assertIn("#1 [待测试] demo.py", pending)
+        created = ChangeJournal()
+        created.record_creation(
+            path="new.py",
+            after_text="value = 1\n",
+            diff="diff",
+        )
+
+        self.assertIn("#1 [待测试][替换] demo.py", pending)
         self.assertIn("[测试通过]", tested)
         self.assertIn("[已回滚]", rolled_back)
         self.assertIn("回滚结果待测试：demo.py", rolled_back)
+        self.assertIn("[创建] new.py", format_change_log(created))
+        self.assertIn("SHA-256 （不存在）", format_change_log(created))
         self.assertIsNone(parse_rollback_target("/rollback"))
         self.assertEqual(parse_rollback_target("/rollback 3"), 3)
         self.assertEqual(parse_rollback_target("/rollback ALL"), "all")

@@ -144,6 +144,38 @@ class ToolingTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(registry.state.snapshot().read_files, ())
 
+    def test_create_tool_does_not_require_read_but_activates_test_gate(self) -> None:
+        created: list[str] = []
+        registry = ToolRegistry()
+        registry.register(
+            ToolDefinition(
+                "create_file",
+                "创建",
+                {"type": "object"},
+                lambda path: created.append(path) or {"ok": True, "path": path},
+                file_access=ToolFileAccess.CREATE,
+                path_argument="path",
+            )
+        )
+
+        result = json.loads(
+            registry.execute(
+                ToolCall(
+                    id="create",
+                    name="create_file",
+                    arguments={"path": "new.py"},
+                )
+            )
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(created, ["new.py"])
+        snapshot = registry.state.snapshot()
+        self.assertEqual(snapshot.read_files, ())
+        self.assertEqual(snapshot.modified_files, ("new.py",))
+        self.assertEqual(snapshot.blocked_write_attempts, 0)
+        self.assertTrue(snapshot.has_unverified_changes)
+
     def test_file_access_metadata_must_be_complete(self) -> None:
         with self.assertRaisesRegex(ToolRegistrationError, "同时配置"):
             ToolDefinition(

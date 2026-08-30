@@ -7,9 +7,10 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from safe_patch_agent.changes import ChangeJournal
+from safe_patch_agent.changes import ChangeJournal, ChangeKind
 from safe_patch_agent.messages import ToolCall
 from safe_patch_agent.workspace import (
+    CreationPreview,
     ReplacementPreview,
     RollbackPreview,
     SafeWorkspace,
@@ -386,6 +387,146 @@ class WorkspaceTests(unittest.TestCase):
         self.assertFalse(approval_called)
         self.assertEqual(target.read_text(encoding="utf-8"), "old\n")
 
+    def test_create_file_previews_exclusively_writes_and_records_creation(self) -> None:
+        previews: list[CreationPreview] = []
+        journal = ChangeJournal()
+
+        def approve(preview: CreationPreview) -> bool:
+            previews.append(preview)
+            return True
+
+        workspace = SafeWorkspace(
+            self.root,
+            creation_approval=approve,
+            change_journal=journal,
+        )
+
+        result = workspace.create_file("src/new.py", "value = 1\n")
+
+        target = self.root / "src" / "new.py"
+        self.assertEqual(target.read_text(encoding="utf-8"), "value = 1\n")
+        self.assertTrue(result["created"])
+        self.assertEqual(result["change_id"], 1)
+        self.assertEqual(previews[0].path, "src/new.py")
+        self.assertIn("--- /dev/null", previews[0].diff)
+        self.assertIn("+++ b/src/new.py", previews[0].diff)
+        self.assertIn("+value = 1", previews[0].diff)
+        summary = journal.summaries()[0]
+        self.assertIs(summary.kind, ChangeKind.CREATE)
+        self.assertIsNone(summary.before_sha256)
+
+    def test_create_file_requires_approval_and_honors_rejection(self) -> None:
+        target = self.root / "new.py"
+
+        with self.assertRaisesRegex(WorkspaceError, "未配置用户确认"):
+            self.workspace.create_file("new.py", "value = 1\n")
+
+        workspace = SafeWorkspace(
+            self.root,
+            creation_approval=lambda _preview: False,
+        )
+        with self.assertRaisesRegex(WorkspaceError, "用户拒绝"):
+            workspace.create_file("new.py", "value = 1\n")
+
+        self.assertFalse(target.exists())
+
+    def test_create_file_rejects_existing_sensitive_and_missing_parent_paths(
+        self,
+    ) -> None:
+        workspace = SafeWorkspace(
+            self.root,
+            creation_approval=lambda _preview: True,
+        )
+
+        with self.assertRaisesRegex(WorkspaceError, "已经存在"):
+            workspace.create_file("README.md", "new\n")
+        with self.assertRaisesRegex(WorkspaceError, "敏感文件"):
+            workspace.create_file(".env", "TOKEN=value\n")
+        with self.assertRaisesRegex(WorkspaceError, "父目录不存在"):
+            workspace.create_file("missing/new.py", "value = 1\n")
+        with self.assertRaisesRegex(WorkspaceError, "超出了"):
+            workspace.create_file("../outside.py", "value = 1\n")
+
+    def test_create_file_rejects_invalid_or_unpreviewable_content(self) -> None:
+        approval_called = False
+
+        def approve(_preview: CreationPreview) -> bool:
+            nonlocal approval_called
+            approval_called = True
+            return True
+
+        workspace = SafeWorkspace(self.root, creation_approval=approve)
+        for content in ("", "bad\x00content"):
+            with self.subTest(content=content), self.assertRaises(WorkspaceError):
+                workspace.create_file("new.py", content)
+
+        with self.assertRaisesRegex(WorkspaceError, "新文件超过"):
+            workspace.create_file("new.py", "x" * 1_000_001)
+        with (
+            patch.object(SafeWorkspace, "_MAX_PATCH_PREVIEW_CHARS", 10),
+            self.assertRaisesRegex(WorkspaceError, "无法完整展示"),
+        ):
+            workspace.create_file("new.py", "value = 1\n")
+
+        self.assertFalse(approval_called)
+        self.assertFalse((self.root / "new.py").exists())
+
+    def test_create_file_checks_journal_capacity_before_approval(self) -> None:
+        approval_called = False
+
+        def approve(_preview: CreationPreview) -> bool:
+            nonlocal approval_called
+            approval_called = True
+            return True
+
+        workspace = SafeWorkspace(
+            self.root,
+            creation_approval=approve,
+            change_journal=ChangeJournal(max_stored_bytes=1),
+        )
+
+        with self.assertRaisesRegex(WorkspaceError, "可回滚内容"):
+            workspace.create_file("new.py", "value = 1\n")
+
+        self.assertFalse(approval_called)
+        self.assertFalse((self.root / "new.py").exists())
+
+    def test_create_file_rejects_target_created_during_approval(self) -> None:
+        target = self.root / "new.py"
+
+        def create_during_approval(_preview: CreationPreview) -> bool:
+            target.write_text("external\n", encoding="utf-8")
+            return True
+
+        workspace = SafeWorkspace(
+            self.root,
+            creation_approval=create_during_approval,
+        )
+
+        with self.assertRaisesRegex(WorkspaceError, "确认期间"):
+            workspace.create_file("new.py", "agent\n")
+
+        self.assertEqual(target.read_text(encoding="utf-8"), "external\n")
+
+    def test_exclusive_create_preserves_file_that_wins_final_race(self) -> None:
+        target = self.root / "new.py"
+        workspace = SafeWorkspace(
+            self.root,
+            creation_approval=lambda _preview: True,
+        )
+
+        def competing_link(_source: Path, destination: Path) -> None:
+            Path(destination).write_text("external\n", encoding="utf-8")
+            raise FileExistsError
+
+        with (
+            patch("safe_patch_agent.workspace.os.link", side_effect=competing_link),
+            self.assertRaisesRegex(WorkspaceError, "拒绝覆盖"),
+        ):
+            workspace.create_file("new.py", "agent\n")
+
+        self.assertEqual(target.read_text(encoding="utf-8"), "external\n")
+
     def test_rollback_latest_restores_content_after_confirmation(self) -> None:
         target = self.root / "replace.py"
         target.write_text("old\n", encoding="utf-8")
@@ -409,6 +550,67 @@ class WorkspaceTests(unittest.TestCase):
         self.assertIn("+old", previews[0].diff)
         self.assertTrue(journal.summaries()[0].rolled_back)
         self.assertEqual(journal.pending_rollback_paths, ("replace.py",))
+
+    def test_rollback_creation_deletes_only_the_unchanged_created_file(self) -> None:
+        previews: list[RollbackPreview] = []
+        journal = ChangeJournal()
+
+        def approve_rollback(preview: RollbackPreview) -> bool:
+            previews.append(preview)
+            return True
+
+        workspace = SafeWorkspace(
+            self.root,
+            creation_approval=lambda _preview: True,
+            change_journal=journal,
+            rollback_approval=approve_rollback,
+        )
+        workspace.create_file("new.py", "value = 1\n")
+
+        result = workspace.rollback_changes()
+
+        self.assertFalse((self.root / "new.py").exists())
+        self.assertEqual(result["deleted_paths"], ("new.py",))
+        self.assertEqual(previews[0].deleted_paths, ("new.py",))
+        self.assertIn("-value = 1", previews[0].diff)
+        self.assertIn("+++ /dev/null", previews[0].diff)
+        self.assertTrue(journal.summaries()[0].rolled_back)
+
+    def test_rollback_all_unwinds_replace_then_deletes_created_file(self) -> None:
+        journal = ChangeJournal()
+        workspace = SafeWorkspace(
+            self.root,
+            replacement_approval=lambda _preview: True,
+            creation_approval=lambda _preview: True,
+            change_journal=journal,
+            rollback_approval=lambda _preview: True,
+        )
+        workspace.create_file("new.py", "one\n")
+        workspace.replace_text("new.py", "one", "two")
+
+        result = workspace.rollback_changes("all")
+
+        self.assertFalse((self.root / "new.py").exists())
+        self.assertEqual(result["change_ids"], (2, 1))
+        self.assertEqual(result["deleted_paths"], ("new.py",))
+
+    def test_rollback_creation_rejects_externally_modified_file(self) -> None:
+        target = self.root / "new.py"
+        journal = ChangeJournal()
+        workspace = SafeWorkspace(
+            self.root,
+            creation_approval=lambda _preview: True,
+            change_journal=journal,
+            rollback_approval=lambda _preview: True,
+        )
+        workspace.create_file("new.py", "agent\n")
+        target.write_text("external\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(WorkspaceError, "已在修改后发生变化"):
+            workspace.rollback_changes()
+
+        self.assertEqual(target.read_text(encoding="utf-8"), "external\n")
+        self.assertFalse(journal.summaries()[0].rolled_back)
 
     def test_rollback_all_unwinds_repeated_changes_in_reverse_order(self) -> None:
         target = self.root / "replace.py"
@@ -515,9 +717,42 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(second.read_text(encoding="utf-8"), "new-b\n")
         self.assertTrue(all(not item.rolled_back for item in journal.summaries()))
 
+    def test_multi_file_creation_rollback_restores_deleted_file_on_failure(
+        self,
+    ) -> None:
+        first = self.root / "a.py"
+        second = self.root / "b.py"
+        journal = ChangeJournal()
+        workspace = SafeWorkspace(
+            self.root,
+            creation_approval=lambda _preview: True,
+            change_journal=journal,
+            rollback_approval=lambda _preview: True,
+        )
+        workspace.create_file("a.py", "created-a\n")
+        workspace.create_file("b.py", "created-b\n")
+        original_unlink = Path.unlink
+
+        def fail_second_delete(path: Path, *args: object, **kwargs: object) -> None:
+            if path == second:
+                raise OSError("模拟删除失败")
+            original_unlink(path, *args, **kwargs)  # type: ignore[arg-type]
+
+        with (
+            patch.object(Path, "unlink", fail_second_delete),
+            self.assertRaisesRegex(WorkspaceError, "已恢复本次写入"),
+        ):
+            workspace.rollback_changes("all")
+
+        self.assertEqual(first.read_text(encoding="utf-8"), "created-a\n")
+        self.assertEqual(second.read_text(encoding="utf-8"), "created-b\n")
+        self.assertTrue(all(not item.rolled_back for item in journal.summaries()))
+
     def test_workspace_rejects_non_callable_approval_handler(self) -> None:
         with self.assertRaisesRegex(WorkspaceError, "必须是可调用对象"):
             SafeWorkspace(self.root, replacement_approval=True)  # type: ignore[arg-type]
+        with self.assertRaisesRegex(WorkspaceError, "creation_approval"):
+            SafeWorkspace(self.root, creation_approval=True)  # type: ignore[arg-type]
 
     def test_replace_text_honors_rejection(self) -> None:
         target = self.root / "replace.py"
@@ -574,6 +809,11 @@ class WorkspaceTests(unittest.TestCase):
         diff = SafeWorkspace._replacement_diff("demo.txt", "old\n", "old")
 
         self.assertIn("文件末尾无换行符", diff)
+
+    def test_empty_file_deletion_diff_still_shows_nonexistent_target(self) -> None:
+        diff = SafeWorkspace._deletion_diff("empty.txt", "")
+
+        self.assertEqual(diff, "--- a/empty.txt\n+++ /dev/null\n")
 
     def test_replace_text_mismatch_leaves_file_unchanged(self) -> None:
         target = self.root / "replace.py"
@@ -716,6 +956,34 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(target.read_text(encoding="utf-8"), "old old\n")
         self.assertEqual(registry.state.snapshot().modified_files, ())
 
+    def test_create_file_registry_does_not_require_read_and_records_write(self) -> None:
+        workspace = SafeWorkspace(
+            self.root,
+            creation_approval=lambda _preview: True,
+        )
+        registry = build_agent_registry(workspace)
+
+        result = json.loads(
+            registry.execute(
+                ToolCall(
+                    id="create",
+                    name="create_file",
+                    arguments={"path": "new.py", "content": "value = 1\n"},
+                )
+            )
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            (self.root / "new.py").read_text(encoding="utf-8"),
+            "value = 1\n",
+        )
+        snapshot = registry.state.snapshot()
+        self.assertEqual(snapshot.read_files, ())
+        self.assertEqual(snapshot.modified_files, ("new.py",))
+        self.assertEqual(snapshot.blocked_write_attempts, 0)
+        self.assertTrue(snapshot.has_unverified_changes)
+
     def test_agent_registry_exposes_replace_text_schema(self) -> None:
         registry = build_agent_registry(self.workspace)
         tool_names = {schema["function"]["name"] for schema in registry.schemas()}
@@ -724,10 +992,22 @@ class WorkspaceTests(unittest.TestCase):
             for schema in registry.schemas()
             if schema["function"]["name"] == "replace_text"
         )["function"]["parameters"]
+        create_schema = next(
+            schema
+            for schema in registry.schemas()
+            if schema["function"]["name"] == "create_file"
+        )["function"]["parameters"]
 
         self.assertEqual(
             tool_names,
-            {"list_files", "read_file", "search_code", "replace_text", "run_tests"},
+            {
+                "list_files",
+                "read_file",
+                "search_code",
+                "replace_text",
+                "create_file",
+                "run_tests",
+            },
         )
         self.assertEqual(
             replace_schema["required"],
@@ -737,6 +1017,8 @@ class WorkspaceTests(unittest.TestCase):
             replace_schema["properties"]["expected_replacements"]["default"],
             1,
         )
+        self.assertEqual(create_schema["required"], ["path", "content"])
+        self.assertEqual(create_schema["properties"]["content"]["minLength"], 1)
 
     def test_run_tests_uses_fixed_command_and_sanitized_environment(self) -> None:
         with (

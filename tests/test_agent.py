@@ -181,7 +181,14 @@ class AgentTests(unittest.TestCase):
         self.assertTrue(json.loads(tool_message.content)["ok"])
         self.assertEqual(
             {tool["function"]["name"] for tool in client.requests[0][1]},
-            {"list_files", "read_file", "replace_text", "run_tests", "search_code"},
+            {
+                "list_files",
+                "read_file",
+                "replace_text",
+                "create_file",
+                "run_tests",
+                "search_code",
+            },
         )
 
     def test_loop_limit_stops_repeated_tool_calls(self) -> None:
@@ -294,6 +301,50 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(result.tool_calls, 3)
         self.assertEqual(result.state.read_files, ("demo.py",))
         self.assertEqual(result.state.modified_files, ("demo.py",))
+
+    def test_agent_can_create_new_file_without_read_then_runs_tests(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            workspace = SafeWorkspace(
+                root,
+                creation_approval=lambda _preview: True,
+            )
+            registry = build_agent_registry(workspace)
+            create_call = ToolCall(
+                id="create",
+                name="create_file",
+                arguments={
+                    "path": "demo.py",
+                    "content": "value = 1\n",
+                },
+            )
+            test_call = ToolCall(id="tests", name="run_tests", arguments={})
+            client = ScriptedClient(
+                [
+                    ChatCompletion(
+                        ChatMessage.assistant(None, (create_call,)),
+                        "tool_calls",
+                    ),
+                    ChatCompletion(
+                        ChatMessage.assistant(None, (test_call,)),
+                        "tool_calls",
+                    ),
+                    ChatCompletion(ChatMessage.assistant("创建完成。"), "stop"),
+                ]
+            )
+
+            with patch("safe_patch_agent.workspace.subprocess.run") as run:
+                run.return_value.returncode = 0
+                run.return_value.stdout = "1 passed\n"
+                result = CodingAgent(client, registry).run("创建 demo.py")
+            content = (root / "demo.py").read_text(encoding="utf-8")
+
+        self.assertEqual(content, "value = 1\n")
+        self.assertEqual(result.answer, "创建完成。")
+        self.assertEqual(result.state.read_files, ())
+        self.assertEqual(result.state.modified_files, ("demo.py",))
+        self.assertEqual(result.state.test_runs, 1)
+        self.assertFalse(result.state.has_unverified_changes)
 
     def test_agent_can_report_a_user_rejected_modification(self) -> None:
         with TemporaryDirectory() as temporary_directory:

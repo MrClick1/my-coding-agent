@@ -25,6 +25,7 @@ class ToolFileAccess(StrEnum):
 
     READ = "read"
     WRITE = "write"
+    CREATE = "create"
 
 
 @dataclass(frozen=True)
@@ -205,7 +206,7 @@ class ToolRegistry:
             result_path = requested_path
         if definition.file_access is ToolFileAccess.READ:
             self.state.mark_file_read(result_path)
-        elif definition.file_access is ToolFileAccess.WRITE:
+        elif definition.file_access in {ToolFileAccess.WRITE, ToolFileAccess.CREATE}:
             self.state.mark_file_modified(result_path)
 
     def _record_test_result(

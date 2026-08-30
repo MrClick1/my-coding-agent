@@ -15,10 +15,11 @@ from safe_patch_agent.agent import (
     CodingAgent,
     CodingSession,
 )
-from safe_patch_agent.changes import ChangeJournal
+from safe_patch_agent.changes import ChangeJournal, ChangeKind
 from safe_patch_agent.config import ConfigurationError, LLMConfig
 from safe_patch_agent.llm_client import LLMError, OpenAICompatibleClient
 from safe_patch_agent.workspace import (
+    CreationPreview,
     ReplacementPreview,
     RollbackPreview,
     SafeWorkspace,
@@ -56,7 +57,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = ChineseArgumentParser(
         prog="safe-patch-agent",
         description=(
-            "运行具备持续聊天、代码搜索、人工确认精确替换和固定测试能力的编程 Agent。"
+            "运行具备持续聊天、代码搜索、人工确认文件创建/精确替换和固定测试能力的编程 Agent。"
         ),
         add_help=False,
     )
@@ -138,6 +139,38 @@ def request_replacement_approval(
     return approved
 
 
+def request_creation_approval(
+    preview: CreationPreview,
+    *,
+    input_stream: TextIO | None = None,
+    output_stream: TextIO | None = None,
+) -> bool:
+    """完整展示新文件 diff，并读取用户的明确批准。"""
+
+    input_stream = sys.stdin if input_stream is None else input_stream
+    output_stream = sys.stderr if output_stream is None else output_stream
+    if not input_stream.isatty():
+        print("无法确认创建：当前输入不是交互式终端。", file=output_stream)
+        return False
+
+    print("\n=== SafePatch 新文件预览 ===", file=output_stream)
+    print(
+        f"文件：{preview.path}；大小：{preview.updated_bytes} 字节",
+        file=output_stream,
+    )
+    print(preview.diff, end="", file=output_stream)
+    print("创建以上文件？[y/N]：", end="", file=output_stream, flush=True)
+    try:
+        answer = input_stream.readline()
+    except (OSError, KeyboardInterrupt):
+        print("\n未获得确认，创建已取消。", file=output_stream)
+        return False
+    approved = answer.strip().casefold() in {"y", "yes", "是"}
+    if not approved:
+        print("创建未获批准，已取消。", file=output_stream)
+    return approved
+
+
 def request_rollback_approval(
     preview: RollbackPreview,
     *,
@@ -159,6 +192,11 @@ def request_rollback_approval(
         f"总大小：{preview.original_bytes} -> {preview.updated_bytes} 字节",
         file=output_stream,
     )
+    if preview.deleted_paths:
+        print(
+            f"将删除本会话创建的文件：{', '.join(preview.deleted_paths)}",
+            file=output_stream,
+        )
     print(preview.diff, end="", file=output_stream)
     print("应用以上回滚？[y/N]：", end="", file=output_stream, flush=True)
     try:
@@ -188,10 +226,16 @@ def format_change_log(journal: ChangeJournal) -> str:
             status = "测试失败"
         else:
             status = "待测试"
+        before_hash = (
+            item.before_sha256[:10]
+            if item.before_sha256 is not None
+            else "（不存在）"
+        )
+        kind = "创建" if item.kind is ChangeKind.CREATE else "替换"
+        detail = "创建文件" if item.kind is ChangeKind.CREATE else f"替换 {item.replacements} 处"
         lines.append(
-            f"  #{item.change_id} [{status}] {item.path}；"
-            f"SHA-256 {item.before_sha256[:10]} -> {item.after_sha256[:10]}；"
-            f"替换 {item.replacements} 处"
+            f"  #{item.change_id} [{status}][{kind}] {item.path}；"
+            f"SHA-256 {before_hash} -> {item.after_sha256[:10]}；{detail}"
         )
     pending_paths = journal.pending_rollback_paths
     if pending_paths:
@@ -402,6 +446,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         workspace = SafeWorkspace(
             args.workspace,
             replacement_approval=request_replacement_approval,
+            creation_approval=request_creation_approval,
             change_journal=change_journal,
             rollback_approval=request_rollback_approval,
         )

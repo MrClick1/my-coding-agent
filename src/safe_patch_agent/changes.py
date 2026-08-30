@@ -5,10 +5,18 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from enum import StrEnum
 
 
 class ChangeJournalError(ValueError):
     """修改日志请求无效，或日志容量不足。"""
+
+
+class ChangeKind(StrEnum):
+    """日志记录所代表的工作区写入类型。"""
+
+    REPLACE = "replace"
+    CREATE = "create"
 
 
 @dataclass
@@ -16,17 +24,18 @@ class ChangeRecord:
     """一次已经获得用户批准并成功写入的文件修改。"""
 
     change_id: int
+    kind: ChangeKind
     path: str
     replacements: int
     diff: str
-    before_sha256: str
+    before_sha256: str | None
     after_sha256: str
     original_bytes: int
     updated_bytes: int
     created_at: str
     test_passed: bool | None = None
     rolled_back: bool = False
-    before_text: str = field(default="", repr=False)
+    before_text: str | None = field(default=None, repr=False)
     after_text: str = field(default="", repr=False)
 
 
@@ -35,9 +44,10 @@ class ChangeSummary:
     """适合展示给用户、且不包含完整文件内容的修改摘要。"""
 
     change_id: int
+    kind: ChangeKind
     path: str
     replacements: int
-    before_sha256: str
+    before_sha256: str | None
     after_sha256: str
     created_at: str
     test_passed: bool | None
@@ -81,16 +91,14 @@ class ChangeJournal:
     def pending_rollback_paths(self) -> tuple[str, ...]:
         return tuple(sorted(self._pending_rollback_paths, key=str.casefold))
 
-    def ensure_can_record(self, before_text: str, after_text: str) -> None:
+    def ensure_can_record(self, before_text: str | None, after_text: str) -> None:
         """在写文件前确认日志能够完整保存可回滚内容。"""
 
         if len(self._records) >= self.max_records:
             raise ChangeJournalError(
                 f"修改日志已达到 {self.max_records} 条上限；文件未修改"
             )
-        required_bytes = len(before_text.encode("utf-8")) + len(
-            after_text.encode("utf-8")
-        )
+        required_bytes = _encoded_size(before_text) + _encoded_size(after_text)
         if self._stored_bytes + required_bytes > self.max_stored_bytes:
             raise ChangeJournalError(
                 "修改日志保存的可回滚内容将超过 "
@@ -101,26 +109,35 @@ class ChangeJournal:
         self,
         *,
         path: str,
-        before_text: str,
+        before_text: str | None,
         after_text: str,
         diff: str,
         replacements: int,
+        kind: ChangeKind = ChangeKind.REPLACE,
     ) -> ChangeRecord:
         """记录一次已经成功写入的修改；调用前应先检查容量。"""
 
         self.ensure_can_record(before_text, after_text)
-        required_bytes = len(before_text.encode("utf-8")) + len(
-            after_text.encode("utf-8")
-        )
+        if not isinstance(kind, ChangeKind):
+            try:
+                kind = ChangeKind(kind)
+            except (TypeError, ValueError) as exc:
+                raise ChangeJournalError("修改日志 kind 无效") from exc
+        if kind is ChangeKind.CREATE and before_text is not None:
+            raise ChangeJournalError("创建记录的 before_text 必须是 None")
+        if kind is ChangeKind.REPLACE and before_text is None:
+            raise ChangeJournalError("替换记录必须包含 before_text")
+        required_bytes = _encoded_size(before_text) + _encoded_size(after_text)
         record = ChangeRecord(
             change_id=self._next_id,
+            kind=kind,
             path=path,
             replacements=replacements,
             diff=diff,
-            before_sha256=_sha256(before_text),
+            before_sha256=_sha256(before_text) if before_text is not None else None,
             after_sha256=_sha256(after_text),
-            original_bytes=len(before_text.encode("utf-8")),
-            updated_bytes=len(after_text.encode("utf-8")),
+            original_bytes=_encoded_size(before_text),
+            updated_bytes=_encoded_size(after_text),
             created_at=datetime.now(UTC).isoformat(timespec="seconds"),
             before_text=before_text,
             after_text=after_text,
@@ -130,12 +147,31 @@ class ChangeJournal:
         self._next_id += 1
         return record
 
+    def record_creation(
+        self,
+        *,
+        path: str,
+        after_text: str,
+        diff: str,
+    ) -> ChangeRecord:
+        """记录一次成功创建的新文件。"""
+
+        return self.record(
+            path=path,
+            before_text=None,
+            after_text=after_text,
+            diff=diff,
+            replacements=0,
+            kind=ChangeKind.CREATE,
+        )
+
     def summaries(self) -> tuple[ChangeSummary, ...]:
         """按发生顺序返回不含文件正文的全部日志摘要。"""
 
         return tuple(
             ChangeSummary(
                 change_id=record.change_id,
+                kind=record.kind,
                 path=record.path,
                 replacements=record.replacements,
                 before_sha256=record.before_sha256,
@@ -190,3 +226,7 @@ class ChangeJournal:
 
 def _sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _encoded_size(text: str | None) -> int:
+    return len(text.encode("utf-8")) if text is not None else 0
