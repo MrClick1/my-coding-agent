@@ -189,6 +189,12 @@ class CodingSession:
         self._turns.clear()
         self.agent.registry.state.start_turn()
 
+    def mark_external_modifications(self, paths: tuple[str, ...]) -> None:
+        """把聊天命令直接产生的文件变化纳入下一轮测试门禁。"""
+
+        for path in paths:
+            self.agent.registry.state.mark_file_modified(path)
+
     def run(self, goal: str) -> AgentResult:
         """在最近的有界问答历史之后执行新一轮任务。"""
 

@@ -9,19 +9,25 @@ from pathlib import Path
 from typing import TextIO
 
 from safe_patch_agent.agent import AgentError, CodingAgent, CodingSession
+from safe_patch_agent.changes import ChangeJournal
 from safe_patch_agent.config import ConfigurationError, LLMConfig
 from safe_patch_agent.llm_client import LLMError, OpenAICompatibleClient
 from safe_patch_agent.workspace import (
     ReplacementPreview,
+    RollbackPreview,
     SafeWorkspace,
     WorkspaceError,
     build_agent_registry,
 )
 
 CHAT_HELP = """可用会话命令：
-  /help   显示这份帮助
-  /clear  清除对话历史；待验证修改不会被清除
-  /exit   退出持续会话
+  /help            显示这份帮助
+  /changes         查看当前会话的修改日志与测试状态
+  /rollback        回滚最近一次修改（先展示反向差异并确认）
+  /rollback <编号> 回滚指定修改；同一文件有更新修改时需先回滚更新项
+  /rollback all    回滚当前会话的全部活动修改
+  /clear           清除对话历史；修改日志和待验证修改不会被清除
+  /exit            退出持续会话
 
 直接输入自然语言任务并回车即可发送。每轮工具状态独立，修改仍需逐次确认并运行测试。"""
 
@@ -121,9 +127,91 @@ def request_replacement_approval(
     return approved
 
 
+def request_rollback_approval(
+    preview: RollbackPreview,
+    *,
+    input_stream: TextIO | None = None,
+    output_stream: TextIO | None = None,
+) -> bool:
+    """展示完整反向 diff，并要求用户明确批准回滚。"""
+
+    input_stream = sys.stdin if input_stream is None else input_stream
+    output_stream = sys.stderr if output_stream is None else output_stream
+    if not input_stream.isatty():
+        print("无法确认回滚：当前输入不是交互式终端。", file=output_stream)
+        return False
+
+    ids = ", ".join(f"#{change_id}" for change_id in preview.change_ids)
+    print("\n=== SafePatch 回滚预览 ===", file=output_stream)
+    print(
+        f"修改：{ids}；文件：{', '.join(preview.paths)}；"
+        f"总大小：{preview.original_bytes} -> {preview.updated_bytes} 字节",
+        file=output_stream,
+    )
+    print(preview.diff, end="", file=output_stream)
+    print("应用以上回滚？[y/N]：", end="", file=output_stream, flush=True)
+    try:
+        answer = input_stream.readline()
+    except (OSError, KeyboardInterrupt):
+        print("\n未获得确认，回滚已取消。", file=output_stream)
+        return False
+    approved = answer.strip().casefold() in {"y", "yes", "是"}
+    if not approved:
+        print("回滚未获批准，已取消。", file=output_stream)
+    return approved
+
+
+def format_change_log(journal: ChangeJournal) -> str:
+    """把修改日志整理为紧凑的中文列表。"""
+
+    summaries = journal.summaries()
+    if not summaries:
+        return "当前会话还没有成功写入的修改。"
+    lines = ["当前会话修改日志："]
+    for item in summaries:
+        if item.rolled_back:
+            status = "已回滚"
+        elif item.test_passed is True:
+            status = "测试通过"
+        elif item.test_passed is False:
+            status = "测试失败"
+        else:
+            status = "待测试"
+        lines.append(
+            f"  #{item.change_id} [{status}] {item.path}；"
+            f"SHA-256 {item.before_sha256[:10]} -> {item.after_sha256[:10]}；"
+            f"替换 {item.replacements} 处"
+        )
+    pending_paths = journal.pending_rollback_paths
+    if pending_paths:
+        lines.append(f"回滚结果待测试：{', '.join(pending_paths)}")
+    return "\n".join(lines)
+
+
+def parse_rollback_target(command: str) -> int | str | None:
+    """解析 `/rollback` 的可选编号或 all 参数。"""
+
+    parts = command.split()
+    if len(parts) == 1:
+        return None
+    if len(parts) != 2:
+        raise ValueError("用法：/rollback [修改编号|all]")
+    if parts[1].casefold() == "all":
+        return "all"
+    try:
+        change_id = int(parts[1])
+    except ValueError as exc:
+        raise ValueError("回滚目标必须是修改编号或 all") from exc
+    if change_id < 1:
+        raise ValueError("修改编号必须是正整数")
+    return change_id
+
+
 def run_chat(
     session: CodingSession,
     *,
+    change_journal: ChangeJournal | None = None,
+    workspace: SafeWorkspace | None = None,
     initial_goal: str | None = None,
     input_stream: TextIO | None = None,
     output_stream: TextIO | None = None,
@@ -170,6 +258,29 @@ def run_chat(
             session.clear()
             print("会话历史已清除；待验证修改（如有）仍需测试。", file=output_stream)
             continue
+        if command == "/changes":
+            if change_journal is None:
+                print("当前会话未启用修改日志。", file=output_stream)
+            else:
+                print(format_change_log(change_journal), file=output_stream)
+            continue
+        if command.split(maxsplit=1)[0] == "/rollback":
+            if change_journal is None or workspace is None:
+                print("当前会话未启用安全回滚。", file=output_stream)
+                continue
+            try:
+                target = parse_rollback_target(goal)
+                rollback = workspace.rollback_changes(target)
+                session.mark_external_modifications(rollback["paths"])
+            except (WorkspaceError, ValueError) as exc:
+                print(f"回滚失败：{exc}", file=output_stream)
+                continue
+            ids = ", ".join(f"#{item}" for item in rollback["change_ids"])
+            print(
+                f"已回滚修改 {ids}；回滚后的文件尚未测试。",
+                file=output_stream,
+            )
+            continue
         if goal.startswith("/"):
             print(f"未知会话命令：{goal}。输入 /help 查看命令。", file=output_stream)
             continue
@@ -190,9 +301,13 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         config = LLMConfig.load(args.env_file)
+        interactive = args.chat or args.goal is None
+        change_journal = ChangeJournal() if interactive else None
         workspace = SafeWorkspace(
             args.workspace,
             replacement_approval=request_replacement_approval,
+            change_journal=change_journal,
+            rollback_approval=request_rollback_approval,
         )
         registry = build_agent_registry(workspace)
         client = OpenAICompatibleClient(config)
@@ -202,8 +317,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_rounds=args.max_rounds,
             max_tool_calls=args.max_tool_calls,
         )
-        if args.chat or args.goal is None:
-            return run_chat(CodingSession(agent), initial_goal=args.goal)
+        if interactive:
+            return run_chat(
+                CodingSession(agent),
+                change_journal=change_journal,
+                workspace=workspace,
+                initial_goal=args.goal,
+            )
         result = agent.run(args.goal)
     except (ConfigurationError, WorkspaceError, LLMError, AgentError, ValueError) as exc:
         print(f"错误：{exc}", file=sys.stderr)

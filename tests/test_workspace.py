@@ -7,9 +7,11 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+from safe_patch_agent.changes import ChangeJournal
 from safe_patch_agent.messages import ToolCall
 from safe_patch_agent.workspace import (
     ReplacementPreview,
+    RollbackPreview,
     SafeWorkspace,
     WorkspaceError,
     build_agent_registry,
@@ -346,6 +348,173 @@ class WorkspaceTests(unittest.TestCase):
 
         self.assertEqual(target.read_text(encoding="utf-8"), "old\n")
 
+    def test_successful_replace_is_recorded_in_session_journal(self) -> None:
+        target = self.root / "replace.py"
+        target.write_text("old\n", encoding="utf-8")
+        journal = ChangeJournal()
+        workspace = SafeWorkspace(
+            self.root,
+            replacement_approval=lambda _preview: True,
+            change_journal=journal,
+        )
+
+        result = workspace.replace_text("replace.py", "old", "new")
+
+        self.assertEqual(result["change_id"], 1)
+        self.assertEqual(journal.record_count, 1)
+        self.assertEqual(journal.summaries()[0].path, "replace.py")
+
+    def test_journal_capacity_is_checked_before_approval_and_write(self) -> None:
+        target = self.root / "replace.py"
+        target.write_text("old\n", encoding="utf-8")
+        approval_called = False
+
+        def approve(_preview: ReplacementPreview) -> bool:
+            nonlocal approval_called
+            approval_called = True
+            return True
+
+        workspace = SafeWorkspace(
+            self.root,
+            replacement_approval=approve,
+            change_journal=ChangeJournal(max_stored_bytes=1),
+        )
+
+        with self.assertRaisesRegex(WorkspaceError, "可回滚内容"):
+            workspace.replace_text("replace.py", "old", "new")
+
+        self.assertFalse(approval_called)
+        self.assertEqual(target.read_text(encoding="utf-8"), "old\n")
+
+    def test_rollback_latest_restores_content_after_confirmation(self) -> None:
+        target = self.root / "replace.py"
+        target.write_text("old\n", encoding="utf-8")
+        previews: list[RollbackPreview] = []
+        journal = ChangeJournal()
+        workspace = SafeWorkspace(
+            self.root,
+            replacement_approval=lambda _preview: True,
+            change_journal=journal,
+            rollback_approval=lambda preview: previews.append(preview) is None,
+        )
+        workspace.replace_text("replace.py", "old", "new")
+
+        result = workspace.rollback_changes()
+
+        self.assertEqual(target.read_text(encoding="utf-8"), "old\n")
+        self.assertEqual(result["change_ids"], (1,))
+        self.assertEqual(result["paths"], ("replace.py",))
+        self.assertEqual(previews[0].change_ids, (1,))
+        self.assertIn("-new", previews[0].diff)
+        self.assertIn("+old", previews[0].diff)
+        self.assertTrue(journal.summaries()[0].rolled_back)
+        self.assertEqual(journal.pending_rollback_paths, ("replace.py",))
+
+    def test_rollback_all_unwinds_repeated_changes_in_reverse_order(self) -> None:
+        target = self.root / "replace.py"
+        target.write_text("one\n", encoding="utf-8")
+        journal = ChangeJournal()
+        workspace = SafeWorkspace(
+            self.root,
+            replacement_approval=lambda _preview: True,
+            change_journal=journal,
+            rollback_approval=lambda _preview: True,
+        )
+        workspace.replace_text("replace.py", "one", "two")
+        workspace.replace_text("replace.py", "two", "three")
+
+        result = workspace.rollback_changes("all")
+
+        self.assertEqual(target.read_text(encoding="utf-8"), "one\n")
+        self.assertEqual(result["change_ids"], (2, 1))
+        self.assertTrue(all(item.rolled_back for item in journal.summaries()))
+
+    def test_rollback_rejects_content_changed_after_agent_write(self) -> None:
+        target = self.root / "replace.py"
+        target.write_text("old\n", encoding="utf-8")
+        approval_called = False
+        journal = ChangeJournal()
+
+        def approve_rollback(_preview: RollbackPreview) -> bool:
+            nonlocal approval_called
+            approval_called = True
+            return True
+
+        workspace = SafeWorkspace(
+            self.root,
+            replacement_approval=lambda _preview: True,
+            change_journal=journal,
+            rollback_approval=approve_rollback,
+        )
+        workspace.replace_text("replace.py", "old", "new")
+        target.write_text("external\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(WorkspaceError, "已在修改后发生变化"):
+            workspace.rollback_changes()
+
+        self.assertFalse(approval_called)
+        self.assertEqual(target.read_text(encoding="utf-8"), "external\n")
+        self.assertFalse(journal.summaries()[0].rolled_back)
+
+    def test_rollback_rechecks_content_after_confirmation(self) -> None:
+        target = self.root / "replace.py"
+        target.write_text("old\n", encoding="utf-8")
+        journal = ChangeJournal()
+
+        def change_during_approval(_preview: RollbackPreview) -> bool:
+            target.write_text("concurrent\n", encoding="utf-8")
+            return True
+
+        workspace = SafeWorkspace(
+            self.root,
+            replacement_approval=lambda _preview: True,
+            change_journal=journal,
+            rollback_approval=change_during_approval,
+        )
+        workspace.replace_text("replace.py", "old", "new")
+
+        with self.assertRaisesRegex(WorkspaceError, "确认期间发生变化"):
+            workspace.rollback_changes()
+
+        self.assertEqual(target.read_text(encoding="utf-8"), "concurrent\n")
+        self.assertFalse(journal.summaries()[0].rolled_back)
+
+    def test_multi_file_rollback_restores_earlier_writes_if_a_write_fails(
+        self,
+    ) -> None:
+        first = self.root / "a.py"
+        second = self.root / "b.py"
+        first.write_text("old-a\n", encoding="utf-8")
+        second.write_text("old-b\n", encoding="utf-8")
+        journal = ChangeJournal()
+        workspace = SafeWorkspace(
+            self.root,
+            replacement_approval=lambda _preview: True,
+            change_journal=journal,
+            rollback_approval=lambda _preview: True,
+        )
+        workspace.replace_text("a.py", "old-a", "new-a")
+        workspace.replace_text("b.py", "old-b", "new-b")
+        atomic_write = workspace._atomic_write
+        write_count = 0
+
+        def fail_second_write(target: Path, content: bytes) -> None:
+            nonlocal write_count
+            write_count += 1
+            if write_count == 2:
+                raise WorkspaceError("模拟写入失败")
+            atomic_write(target, content)
+
+        with (
+            patch.object(workspace, "_atomic_write", side_effect=fail_second_write),
+            self.assertRaisesRegex(WorkspaceError, "已恢复本次写入"),
+        ):
+            workspace.rollback_changes("all")
+
+        self.assertEqual(first.read_text(encoding="utf-8"), "new-a\n")
+        self.assertEqual(second.read_text(encoding="utf-8"), "new-b\n")
+        self.assertTrue(all(not item.rolled_back for item in journal.summaries()))
+
     def test_workspace_rejects_non_callable_approval_handler(self) -> None:
         with self.assertRaisesRegex(WorkspaceError, "必须是可调用对象"):
             SafeWorkspace(self.root, replacement_approval=True)  # type: ignore[arg-type]
@@ -628,6 +797,27 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(snapshot.test_runs, 1)
         self.assertFalse(snapshot.last_test_passed)
         self.assertFalse(snapshot.has_unverified_changes)
+
+    def test_run_tests_updates_change_journal_status(self) -> None:
+        target = self.root / "replace.py"
+        target.write_text("old\n", encoding="utf-8")
+        journal = ChangeJournal()
+        workspace = SafeWorkspace(
+            self.root,
+            replacement_approval=lambda _preview: True,
+            change_journal=journal,
+        )
+        workspace.replace_text("replace.py", "old", "new")
+        with patch("safe_patch_agent.workspace.subprocess.run") as run:
+            run.return_value = subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout="1 passed\n",
+            )
+
+            workspace.run_tests()
+
+        self.assertTrue(journal.summaries()[0].test_passed)
 
     def test_run_tests_reports_timeout_with_bounded_output(self) -> None:
         long_output = b"start\n" + b"x" * 500

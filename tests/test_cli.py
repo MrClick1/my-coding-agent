@@ -7,13 +7,17 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from safe_patch_agent.changes import ChangeJournal
 from safe_patch_agent.cli import (
     build_parser,
+    format_change_log,
     main,
+    parse_rollback_target,
     request_replacement_approval,
+    request_rollback_approval,
     run_chat,
 )
-from safe_patch_agent.workspace import ReplacementPreview
+from safe_patch_agent.workspace import ReplacementPreview, RollbackPreview, SafeWorkspace
 
 
 class InteractiveStringIO(StringIO):
@@ -25,6 +29,7 @@ class FakeSession:
     def __init__(self) -> None:
         self.goals: list[str] = []
         self.clear_count = 0
+        self.external_modifications: list[tuple[str, ...]] = []
 
     def run(self, goal: str) -> SimpleNamespace:
         self.goals.append(goal)
@@ -32,6 +37,9 @@ class FakeSession:
 
     def clear(self) -> None:
         self.clear_count += 1
+
+    def mark_external_modifications(self, paths: tuple[str, ...]) -> None:
+        self.external_modifications.append(paths)
 
 
 class CLITests(unittest.TestCase):
@@ -120,6 +128,54 @@ class CLITests(unittest.TestCase):
         self.assertFalse(approved)
         self.assertIn("不是交互式终端", output.getvalue())
 
+    def test_rollback_approval_shows_ids_paths_and_reverse_diff(self) -> None:
+        preview = RollbackPreview(
+            change_ids=(2, 1),
+            paths=("demo.py",),
+            diff="--- a/demo.py\n+++ b/demo.py\n-new\n+old\n",
+            original_bytes=4,
+            updated_bytes=4,
+        )
+        output = StringIO()
+
+        approved = request_rollback_approval(
+            preview,
+            input_stream=InteractiveStringIO("y\n"),
+            output_stream=output,
+        )
+
+        self.assertTrue(approved)
+        self.assertIn("SafePatch 回滚预览", output.getvalue())
+        self.assertIn("#2, #1", output.getvalue())
+        self.assertIn("-new\n+old", output.getvalue())
+
+    def test_change_log_and_rollback_target_formatting(self) -> None:
+        journal = ChangeJournal()
+        record = journal.record(
+            path="demo.py",
+            before_text="old",
+            after_text="new",
+            diff="diff",
+            replacements=1,
+        )
+
+        pending = format_change_log(journal)
+        journal.record_test_result(True)
+        tested = format_change_log(journal)
+        journal.mark_rolled_back((record,))
+        rolled_back = format_change_log(journal)
+
+        self.assertIn("#1 [待测试] demo.py", pending)
+        self.assertIn("[测试通过]", tested)
+        self.assertIn("[已回滚]", rolled_back)
+        self.assertIn("回滚结果待测试：demo.py", rolled_back)
+        self.assertIsNone(parse_rollback_target("/rollback"))
+        self.assertEqual(parse_rollback_target("/rollback 3"), 3)
+        self.assertEqual(parse_rollback_target("/rollback ALL"), "all")
+        self.assertEqual(parse_rollback_target("/rollback\tall"), "all")
+        with self.assertRaisesRegex(ValueError, "修改编号"):
+            parse_rollback_target("/rollback zero")
+
     def test_chat_runs_multiple_inputs_and_session_commands(self) -> None:
         session = FakeSession()
         output = StringIO()
@@ -156,6 +212,41 @@ class CLITests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(session.goals, ["先介绍项目"])
         self.assertIn("已处理：先介绍项目", output.getvalue())
+
+    def test_chat_can_show_and_rollback_session_changes(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            target = root / "demo.py"
+            target.write_text("old\n", encoding="utf-8")
+            journal = ChangeJournal()
+            workspace = SafeWorkspace(
+                root,
+                replacement_approval=lambda _preview: True,
+                change_journal=journal,
+                rollback_approval=lambda _preview: True,
+            )
+            workspace.replace_text("demo.py", "old", "new")
+            session = FakeSession()
+            output = StringIO()
+
+            exit_code = run_chat(  # type: ignore[arg-type]
+                session,
+                change_journal=journal,
+                workspace=workspace,
+                input_stream=InteractiveStringIO(
+                    "/changes\n/rollback 1\n/changes\n/exit\n"
+                ),
+                output_stream=output,
+            )
+
+            restored = target.read_text(encoding="utf-8")
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(restored, "old\n")
+        self.assertEqual(session.external_modifications, [("demo.py",)])
+        self.assertIn("#1 [待测试]", output.getvalue())
+        self.assertIn("已回滚修改 #1", output.getvalue())
+        self.assertIn("#1 [已回滚]", output.getvalue())
 
     def test_chat_rejects_non_interactive_input(self) -> None:
         session = FakeSession()

@@ -431,6 +431,16 @@ class AgentTests(unittest.TestCase):
             [CodingAgent(client, registry).system_prompt, "第二次问题"],
         )
 
+    def test_session_external_modification_reactivates_test_gate(self) -> None:
+        registry = CountingRegistry()
+        session = CodingSession(CodingAgent(ScriptedClient([]), registry))
+
+        session.mark_external_modifications(("demo.py", "src/app.py"))
+
+        snapshot = registry.state.snapshot()
+        self.assertEqual(snapshot.modified_files, ("demo.py", "src/app.py"))
+        self.assertTrue(snapshot.has_unverified_changes)
+
     def test_session_history_keeps_only_configured_recent_turns(self) -> None:
         registry = CountingRegistry()
         client = ScriptedClient(

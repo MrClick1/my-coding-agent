@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from safe_patch_agent.changes import ChangeJournal, ChangeJournalError
 from safe_patch_agent.tooling import ToolDefinition, ToolFileAccess, ToolRegistry
 
 
@@ -35,6 +36,20 @@ class ReplacementPreview:
 
 
 ReplacementApproval = Callable[[ReplacementPreview], bool]
+
+
+@dataclass(frozen=True)
+class RollbackPreview:
+    """等待用户确认的一次会话修改回滚预览。"""
+
+    change_ids: tuple[int, ...]
+    paths: tuple[str, ...]
+    diff: str
+    original_bytes: int
+    updated_bytes: int
+
+
+RollbackApproval = Callable[[RollbackPreview], bool]
 
 
 class SafeWorkspace:
@@ -110,6 +125,8 @@ class SafeWorkspace:
         root: Path,
         *,
         replacement_approval: ReplacementApproval | None = None,
+        change_journal: ChangeJournal | None = None,
+        rollback_approval: RollbackApproval | None = None,
     ) -> None:
         resolved_root = root.expanduser().resolve()
         if not resolved_root.exists():
@@ -118,8 +135,12 @@ class SafeWorkspace:
             raise WorkspaceError(f"工作区路径不是目录：{resolved_root}")
         if replacement_approval is not None and not callable(replacement_approval):
             raise WorkspaceError("replacement_approval 必须是可调用对象")
+        if rollback_approval is not None and not callable(rollback_approval):
+            raise WorkspaceError("rollback_approval 必须是可调用对象")
         self.root = resolved_root
         self.replacement_approval = replacement_approval
+        self.change_journal = change_journal
+        self.rollback_approval = rollback_approval
 
     def resolve(self, relative_path: str, *, must_exist: bool = True) -> Path:
         """解析相对路径，并确保解析结果仍位于工作区内。"""
@@ -465,6 +486,11 @@ class SafeWorkspace:
                 "修改预览超过 "
                 f"{self._MAX_PATCH_PREVIEW_CHARS} 字符上限，无法完整展示；文件未修改"
             )
+        if self.change_journal is not None:
+            try:
+                self.change_journal.ensure_can_record(original_text, updated_text)
+            except ChangeJournalError as exc:
+                raise WorkspaceError(str(exc)) from exc
         preview = ReplacementPreview(
             path=display_path,
             diff=diff,
@@ -486,14 +512,127 @@ class SafeWorkspace:
             raise WorkspaceError("文件在确认期间发生变化；为避免覆盖新内容，已取消修改")
 
         self._atomic_write(target, updated_bytes)
+        change_id: int | None = None
+        if self.change_journal is not None:
+            change_id = self.change_journal.record(
+                path=display_path,
+                before_text=original_text,
+                after_text=updated_text,
+                diff=diff,
+                replacements=actual_replacements,
+            ).change_id
         return {
             "ok": True,
             "path": display_path,
             "approved": True,
+            "change_id": change_id,
             "diff": diff,
             "replacements": actual_replacements,
             "original_bytes": original_bytes,
             "updated_bytes": len(updated_bytes),
+        }
+
+    def rollback_changes(
+        self,
+        target: int | str | None = None,
+    ) -> dict[str, Any]:
+        """校验并回滚当前会话的一条或全部活动修改。"""
+
+        if self.change_journal is None:
+            raise WorkspaceError("当前工作区未启用会话修改日志")
+        try:
+            records = self.change_journal.records_for_rollback(target)
+        except ChangeJournalError as exc:
+            raise WorkspaceError(str(exc)) from exc
+
+        current_texts: dict[str, str] = {}
+        current_bytes: dict[str, int] = {}
+        targets: dict[str, Path] = {}
+        for record in records:
+            if record.path in current_texts:
+                continue
+            resolved = self.resolve(record.path)
+            if not resolved.is_file():
+                raise WorkspaceError(f"回滚目标不是文件：{record.path}")
+            text, byte_count = self._read_utf8_text(resolved, record.path)
+            targets[record.path] = resolved
+            current_texts[record.path] = text
+            current_bytes[record.path] = byte_count
+
+        restored_texts = dict(current_texts)
+        for record in records:
+            if restored_texts[record.path] != record.after_text:
+                raise WorkspaceError(
+                    f"文件 {record.path} 已在修改后发生变化；"
+                    "为避免覆盖新内容，已取消回滚"
+                )
+            restored_texts[record.path] = record.before_text
+
+        diffs = [
+            self._replacement_diff(path, current_texts[path], restored_texts[path])
+            for path in sorted(restored_texts, key=str.casefold)
+        ]
+        diff = "".join(diffs)
+        if len(diff) > self._MAX_PATCH_PREVIEW_CHARS:
+            raise WorkspaceError(
+                "回滚预览超过 "
+                f"{self._MAX_PATCH_PREVIEW_CHARS} 字符上限，无法完整展示；文件未修改"
+            )
+        encoded_restored = {
+            path: text.encode("utf-8") for path, text in restored_texts.items()
+        }
+        preview = RollbackPreview(
+            change_ids=tuple(record.change_id for record in records),
+            paths=tuple(sorted(restored_texts, key=str.casefold)),
+            diff=diff,
+            original_bytes=sum(current_bytes.values()),
+            updated_bytes=sum(len(content) for content in encoded_restored.values()),
+        )
+        if self.rollback_approval is None:
+            raise WorkspaceError("未配置用户确认，拒绝回滚文件")
+        try:
+            approved = self.rollback_approval(preview)
+        except Exception as exc:
+            raise WorkspaceError("无法获得用户确认；文件未修改") from exc
+        if approved is not True:
+            raise WorkspaceError("用户拒绝了回滚；文件未修改")
+
+        for path, resolved in targets.items():
+            text, byte_count = self._read_utf8_text(resolved, path)
+            if text != current_texts[path] or byte_count != current_bytes[path]:
+                raise WorkspaceError(
+                    f"文件 {path} 在确认期间发生变化；"
+                    "为避免覆盖新内容，已取消回滚"
+                )
+
+        written_paths: list[str] = []
+        try:
+            for path in sorted(targets, key=str.casefold):
+                self._atomic_write(targets[path], encoded_restored[path])
+                written_paths.append(path)
+        except WorkspaceError as exc:
+            restore_failed = False
+            for path in reversed(written_paths):
+                try:
+                    self._atomic_write(
+                        targets[path],
+                        current_texts[path].encode("utf-8"),
+                    )
+                except WorkspaceError:
+                    restore_failed = True
+            if restore_failed:
+                raise WorkspaceError(
+                    "回滚写入失败，且无法完整恢复已经写入的文件；"
+                    "请立即检查工作区"
+                ) from exc
+            raise WorkspaceError("回滚写入失败，已恢复本次写入的文件") from exc
+
+        self.change_journal.mark_rolled_back(records)
+        return {
+            "ok": True,
+            "change_ids": tuple(record.change_id for record in records),
+            "paths": tuple(sorted(restored_texts, key=str.casefold)),
+            "diff": diff,
         }
 
     @staticmethod
@@ -538,7 +677,7 @@ class SafeWorkspace:
             output, output_truncated = self._truncate_test_output(
                 self._decode_test_output(exc.stdout)
             )
-            return {
+            result = {
                 "ok": True,
                 "passed": False,
                 "command": "python -m pytest -q",
@@ -549,13 +688,17 @@ class SafeWorkspace:
                 "output": output,
                 "output_truncated": output_truncated,
             }
+            if self.change_journal is not None:
+                self.change_journal.record_test_result(False)
+            return result
         except OSError as exc:
             raise WorkspaceError("无法启动固定的 pytest 测试命令") from exc
 
         output, output_truncated = self._truncate_test_output(completed.stdout or "")
-        return {
+        passed = completed.returncode == 0
+        result = {
             "ok": True,
-            "passed": completed.returncode == 0,
+            "passed": passed,
             "command": "python -m pytest -q",
             "exit_code": completed.returncode,
             "timed_out": False,
@@ -564,6 +707,9 @@ class SafeWorkspace:
             "output": output,
             "output_truncated": output_truncated,
         }
+        if self.change_journal is not None:
+            self.change_journal.record_test_result(passed)
+        return result
 
     def _read_utf8_text(self, target: Path, display_path: str) -> tuple[str, int]:
         """在固定字节上限内读取 UTF-8 文本。"""
