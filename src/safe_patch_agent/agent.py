@@ -75,12 +75,28 @@ class CodingAgent:
         self.system_prompt = system_prompt
 
     def run(self, goal: str) -> AgentResult:
+        """执行一个不继承历史的独立任务。"""
+
+        return self._run(goal, history=())
+
+    def _run(
+        self,
+        goal: str,
+        *,
+        history: tuple[ChatMessage, ...],
+    ) -> AgentResult:
+        """执行一轮任务，并在系统提示词后附加已压缩的会话历史。"""
+
         goal = goal.strip()
         if not goal:
             raise ValueError("任务目标不能为空")
 
-        self.registry.state.reset()
-        messages = [ChatMessage.system(self.system_prompt), ChatMessage.user(goal)]
+        self.registry.state.start_turn()
+        messages = [
+            ChatMessage.system(self.system_prompt),
+            *history,
+            ChatMessage.user(goal),
+        ]
         tool_call_count = 0
 
         for round_number in range(1, self.max_rounds + 1):
@@ -127,3 +143,94 @@ class CodingAgent:
         raise AgentLoopLimitError(
             f"Agent 已达到 {self.max_rounds} 轮模型调用上限，但仍未获得最终答案"
         )
+
+
+@dataclass(frozen=True)
+class ConversationTurn:
+    """持续会话中保留的一轮用户目标与最终回答。"""
+
+    goal: str
+    answer: str
+
+
+class CodingSession:
+    """保留有界对话上下文，同时让每轮工具状态相互隔离。"""
+
+    _MAX_STORED_MESSAGE_CHARS = 20_000
+    _TRUNCATION_MARKER = "\n... [会话历史已截断]"
+
+    def __init__(
+        self,
+        agent: CodingAgent,
+        *,
+        max_history_turns: int = 20,
+        max_history_chars: int = 80_000,
+    ) -> None:
+        if not isinstance(max_history_turns, int) or isinstance(
+            max_history_turns, bool
+        ) or max_history_turns < 1:
+            raise ValueError("max_history_turns 必须至少为 1")
+        if not isinstance(max_history_chars, int) or isinstance(
+            max_history_chars, bool
+        ) or max_history_chars < 1_000:
+            raise ValueError("max_history_chars 必须至少为 1000")
+        self.agent = agent
+        self.max_history_turns = max_history_turns
+        self.max_history_chars = max_history_chars
+        self._turns: list[ConversationTurn] = []
+
+    @property
+    def turn_count(self) -> int:
+        return len(self._turns)
+
+    def clear(self) -> None:
+        """清除对话历史，但保留真实存在的待验证修改。"""
+
+        self._turns.clear()
+        self.agent.registry.state.start_turn()
+
+    def run(self, goal: str) -> AgentResult:
+        """在最近的有界问答历史之后执行新一轮任务。"""
+
+        normalized_goal = goal.strip()
+        if not normalized_goal:
+            raise ValueError("任务目标不能为空")
+        result = self.agent._run(
+            normalized_goal,
+            history=self._history_messages(),
+        )
+        self._turns.append(
+            ConversationTurn(
+                goal=self._truncate_for_history(normalized_goal),
+                answer=self._truncate_for_history(result.answer),
+            )
+        )
+        if len(self._turns) > self.max_history_turns:
+            del self._turns[: -self.max_history_turns]
+        return result
+
+    def _history_messages(self) -> tuple[ChatMessage, ...]:
+        selected_turns: list[ConversationTurn] = []
+        used_chars = 0
+        for turn in reversed(self._turns[-self.max_history_turns :]):
+            turn_chars = len(turn.goal) + len(turn.answer)
+            if used_chars + turn_chars > self.max_history_chars:
+                break
+            selected_turns.append(turn)
+            used_chars += turn_chars
+
+        messages: list[ChatMessage] = []
+        for turn in reversed(selected_turns):
+            messages.append(ChatMessage.user(turn.goal))
+            messages.append(ChatMessage.assistant(turn.answer))
+        return tuple(messages)
+
+    def _truncate_for_history(self, text: str) -> str:
+        per_message_limit = min(
+            self._MAX_STORED_MESSAGE_CHARS,
+            self.max_history_chars // 2,
+        )
+        if len(text) <= per_message_limit:
+            return text
+        retained_chars = per_message_limit - len(self._TRUNCATION_MARKER)
+        return f"{text[:retained_chars]}{self._TRUNCATION_MARKER}"

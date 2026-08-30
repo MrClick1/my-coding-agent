@@ -11,6 +11,7 @@ from safe_patch_agent.agent import (
     AgentToolLimitError,
     AgentVerificationError,
     CodingAgent,
+    CodingSession,
 )
 from safe_patch_agent.llm_client import ChatCompletion
 from safe_patch_agent.messages import ChatMessage, ToolCall
@@ -306,6 +307,188 @@ class AgentTests(unittest.TestCase):
 
             with self.assertRaisesRegex(AgentVerificationError, "没有运行测试"):
                 CodingAgent(client, registry, max_rounds=3).run("修改")
+
+    def test_unverified_change_survives_into_next_agent_turn(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "demo.py").write_text("old\n", encoding="utf-8")
+            registry = build_approved_registry(root)
+            first_client = ScriptedClient(
+                [
+                    ChatCompletion(
+                        ChatMessage.assistant(
+                            None,
+                            (
+                                ToolCall(
+                                    id="read",
+                                    name="read_file",
+                                    arguments={"path": "demo.py"},
+                                ),
+                            ),
+                        ),
+                        "tool_calls",
+                    ),
+                    ChatCompletion(
+                        ChatMessage.assistant(
+                            None,
+                            (
+                                ToolCall(
+                                    id="replace",
+                                    name="replace_text",
+                                    arguments={
+                                        "path": "demo.py",
+                                        "old_text": "old",
+                                        "new_text": "new",
+                                    },
+                                ),
+                            ),
+                        ),
+                        "tool_calls",
+                    ),
+                    ChatCompletion(ChatMessage.assistant("已修改。"), "stop"),
+                ]
+            )
+            with self.assertRaises(AgentVerificationError):
+                CodingAgent(first_client, registry, max_rounds=3).run("修改")
+
+            test_call = ToolCall(id="tests", name="run_tests", arguments={})
+            second_client = ScriptedClient(
+                [
+                    ChatCompletion(ChatMessage.assistant("无需继续。"), "stop"),
+                    ChatCompletion(
+                        ChatMessage.assistant(None, (test_call,)),
+                        "tool_calls",
+                    ),
+                    ChatCompletion(ChatMessage.assistant("测试完成。"), "stop"),
+                ]
+            )
+            with patch("safe_patch_agent.workspace.subprocess.run") as run:
+                run.return_value.returncode = 0
+                run.return_value.stdout = "1 passed\n"
+                result = CodingAgent(second_client, registry).run("继续")
+
+        self.assertEqual(result.answer, "测试完成。")
+        self.assertEqual(result.state.modified_files, ("demo.py",))
+        self.assertEqual(result.state.test_runs, 1)
+        self.assertTrue(result.state.last_test_passed)
+        reminder = second_client.requests[1][0][-1]
+        self.assertEqual(reminder.role.value, "system")
+        self.assertIn("必须调用 run_tests", reminder.content)
+
+    def test_session_keeps_compact_answers_but_not_old_tool_messages(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "README.md").write_text("# Demo\n", encoding="utf-8")
+            registry = build_approved_registry(root)
+            read_call = ToolCall(
+                id="read",
+                name="read_file",
+                arguments={"path": "README.md"},
+            )
+            client = ScriptedClient(
+                [
+                    ChatCompletion(ChatMessage.assistant(None, (read_call,)), "tool_calls"),
+                    ChatCompletion(ChatMessage.assistant("标题是 Demo。"), "stop"),
+                    ChatCompletion(ChatMessage.assistant("它来自上一轮回答。"), "stop"),
+                ]
+            )
+            session = CodingSession(CodingAgent(client, registry))
+
+            first_result = session.run("README 的标题是什么？")
+            second_result = session.run("你上一轮发现了什么？")
+
+        self.assertEqual(first_result.state.read_files, ("README.md",))
+        self.assertEqual(second_result.state.read_files, ())
+        self.assertEqual(session.turn_count, 2)
+        second_turn_messages = client.requests[2][0]
+        self.assertEqual(
+            [message.role.value for message in second_turn_messages],
+            ["system", "user", "assistant", "user"],
+        )
+        self.assertEqual(second_turn_messages[1].content, "README 的标题是什么？")
+        self.assertEqual(second_turn_messages[2].content, "标题是 Demo。")
+        self.assertEqual(second_turn_messages[3].content, "你上一轮发现了什么？")
+
+    def test_session_clear_removes_history_and_tool_state(self) -> None:
+        registry = CountingRegistry()
+        client = ScriptedClient(
+            [
+                ChatCompletion(ChatMessage.assistant("第一次回答。"), "stop"),
+                ChatCompletion(ChatMessage.assistant("第二次回答。"), "stop"),
+            ]
+        )
+        session = CodingSession(CodingAgent(client, registry))
+
+        session.run("第一次问题")
+        registry.state.mark_file_read("demo.py")
+        session.clear()
+        session.run("第二次问题")
+
+        self.assertEqual(session.turn_count, 1)
+        self.assertEqual(registry.state.snapshot().read_files, ())
+        self.assertEqual(
+            [message.content for message in client.requests[1][0]],
+            [CodingAgent(client, registry).system_prompt, "第二次问题"],
+        )
+
+    def test_session_history_keeps_only_configured_recent_turns(self) -> None:
+        registry = CountingRegistry()
+        client = ScriptedClient(
+            [
+                ChatCompletion(ChatMessage.assistant("回答一"), "stop"),
+                ChatCompletion(ChatMessage.assistant("回答二"), "stop"),
+                ChatCompletion(ChatMessage.assistant("回答三"), "stop"),
+            ]
+        )
+        session = CodingSession(
+            CodingAgent(client, registry),
+            max_history_turns=1,
+        )
+
+        session.run("问题一")
+        session.run("问题二")
+        session.run("问题三")
+
+        self.assertEqual(session.turn_count, 1)
+        third_request_contents = [message.content for message in client.requests[2][0]]
+        self.assertNotIn("问题一", third_request_contents)
+        self.assertIn("问题二", third_request_contents)
+        self.assertIn("回答二", third_request_contents)
+        self.assertIn("问题三", third_request_contents)
+
+    def test_session_truncates_large_messages_before_reusing_them(self) -> None:
+        registry = CountingRegistry()
+        client = ScriptedClient(
+            [
+                ChatCompletion(ChatMessage.assistant("a" * 700), "stop"),
+                ChatCompletion(ChatMessage.assistant("完成"), "stop"),
+            ]
+        )
+        session = CodingSession(
+            CodingAgent(client, registry),
+            max_history_chars=1_000,
+        )
+
+        session.run("q" * 700)
+        session.run("继续")
+
+        reused_history = client.requests[1][0][1:3]
+        self.assertTrue(all(len(message.content or "") <= 500 for message in reused_history))
+        self.assertTrue(
+            all("会话历史已截断" in (message.content or "") for message in reused_history)
+        )
+
+    def test_session_rejects_invalid_history_limits(self) -> None:
+        agent = CodingAgent(ScriptedClient([]), CountingRegistry())
+
+        with self.assertRaisesRegex(ValueError, "max_history_turns"):
+            CodingSession(agent, max_history_turns=0)
+        with self.assertRaisesRegex(ValueError, "max_history_turns"):
+            CodingSession(agent, max_history_turns=True)
+        with self.assertRaisesRegex(ValueError, "max_history_chars"):
+            CodingSession(agent, max_history_chars=999)
+        with self.assertRaisesRegex(ValueError, "max_history_chars"):
+            CodingSession(agent, max_history_chars=1_000.5)  # type: ignore[arg-type]
 
 
 if __name__ == "__main__":

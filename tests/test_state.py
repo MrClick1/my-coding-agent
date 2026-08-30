@@ -55,6 +55,22 @@ class AgentStateTests(unittest.TestCase):
         state.mark_file_modified("src/app.py")
         self.assertTrue(state.snapshot().has_unverified_changes)
 
+    def test_start_turn_preserves_only_unverified_modification_state(self) -> None:
+        state = AgentState()
+        state.mark_file_read("src/app.py")
+        state.mark_file_modified("src/app.py")
+
+        state.start_turn()
+
+        snapshot = state.snapshot()
+        self.assertEqual(snapshot.read_files, ())
+        self.assertEqual(snapshot.modified_files, ("src/app.py",))
+        self.assertTrue(snapshot.has_unverified_changes)
+        state.record_test_result(True)
+        state.start_turn()
+        self.assertEqual(state.snapshot().modified_files, ())
+        self.assertFalse(state.snapshot().has_unverified_changes)
+
     def test_invalid_state_paths_are_rejected(self) -> None:
         for path in ("", ".", "../outside.py"):
             with self.subTest(path=path), self.assertRaises(AgentStateError):

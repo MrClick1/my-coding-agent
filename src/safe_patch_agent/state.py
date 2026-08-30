@@ -44,6 +44,16 @@ class AgentState:
         self.last_test_passed = None
         self.has_unverified_changes = False
 
+    def start_turn(self) -> None:
+        """开始新一轮，并保留上一轮尚未验证的真实文件修改。"""
+
+        self._read_files.clear()
+        self.blocked_write_attempts = 0
+        self.test_runs = 0
+        self.last_test_passed = None
+        if not self.has_unverified_changes:
+            self._modified_files.clear()
+
     def mark_file_read(self, path: str) -> None:
         """记录已成功读取完整或指定范围的文件。"""
 
