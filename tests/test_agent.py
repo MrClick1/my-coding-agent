@@ -186,6 +186,7 @@ class AgentTests(unittest.TestCase):
                 "read_file",
                 "replace_text",
                 "create_file",
+                "delete_file",
                 "run_tests",
                 "search_code",
             },
@@ -343,6 +344,58 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(result.answer, "创建完成。")
         self.assertEqual(result.state.read_files, ())
         self.assertEqual(result.state.modified_files, ("demo.py",))
+        self.assertEqual(result.state.test_runs, 1)
+        self.assertFalse(result.state.has_unverified_changes)
+
+    def test_agent_can_delete_file_after_read_then_runs_tests(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            target = root / "obsolete.py"
+            target.write_text("value = 1\n", encoding="utf-8")
+            workspace = SafeWorkspace(
+                root,
+                deletion_approval=lambda _preview: True,
+            )
+            registry = build_agent_registry(workspace)
+            read_call = ToolCall(
+                id="read",
+                name="read_file",
+                arguments={"path": "obsolete.py"},
+            )
+            delete_call = ToolCall(
+                id="delete",
+                name="delete_file",
+                arguments={"path": "obsolete.py"},
+            )
+            test_call = ToolCall(id="tests", name="run_tests", arguments={})
+            client = ScriptedClient(
+                [
+                    ChatCompletion(
+                        ChatMessage.assistant(None, (read_call,)),
+                        "tool_calls",
+                    ),
+                    ChatCompletion(
+                        ChatMessage.assistant(None, (delete_call,)),
+                        "tool_calls",
+                    ),
+                    ChatCompletion(
+                        ChatMessage.assistant(None, (test_call,)),
+                        "tool_calls",
+                    ),
+                    ChatCompletion(ChatMessage.assistant("删除完成。"), "stop"),
+                ]
+            )
+
+            with patch("safe_patch_agent.workspace.subprocess.run") as run:
+                run.return_value.returncode = 0
+                run.return_value.stdout = "1 passed\n"
+                result = CodingAgent(client, registry).run("删除 obsolete.py")
+            deleted = not target.exists()
+
+        self.assertTrue(deleted)
+        self.assertEqual(result.answer, "删除完成。")
+        self.assertEqual(result.state.read_files, ("obsolete.py",))
+        self.assertEqual(result.state.modified_files, ("obsolete.py",))
         self.assertEqual(result.state.test_runs, 1)
         self.assertFalse(result.state.has_unverified_changes)
 

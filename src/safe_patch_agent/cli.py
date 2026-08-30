@@ -20,6 +20,7 @@ from safe_patch_agent.config import ConfigurationError, LLMConfig
 from safe_patch_agent.llm_client import LLMError, OpenAICompatibleClient
 from safe_patch_agent.workspace import (
     CreationPreview,
+    DeletionPreview,
     ReplacementPreview,
     RollbackPreview,
     SafeWorkspace,
@@ -57,7 +58,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = ChineseArgumentParser(
         prog="safe-patch-agent",
         description=(
-            "运行具备持续聊天、代码搜索、人工确认文件创建/精确替换和固定测试能力的编程 Agent。"
+            "运行具备持续聊天、代码搜索、人工确认文件创建/精确替换/删除和固定测试能力的编程 Agent。"
         ),
         add_help=False,
     )
@@ -171,6 +172,38 @@ def request_creation_approval(
     return approved
 
 
+def request_deletion_approval(
+    preview: DeletionPreview,
+    *,
+    input_stream: TextIO | None = None,
+    output_stream: TextIO | None = None,
+) -> bool:
+    """完整展示删除 diff，并读取用户的明确批准。"""
+
+    input_stream = sys.stdin if input_stream is None else input_stream
+    output_stream = sys.stderr if output_stream is None else output_stream
+    if not input_stream.isatty():
+        print("无法确认删除：当前输入不是交互式终端。", file=output_stream)
+        return False
+
+    print("\n=== SafePatch 文件删除预览 ===", file=output_stream)
+    print(
+        f"文件：{preview.path}；大小：{preview.original_bytes} -> 0 字节",
+        file=output_stream,
+    )
+    print(preview.diff, end="", file=output_stream)
+    print("删除以上文件？[y/N]：", end="", file=output_stream, flush=True)
+    try:
+        answer = input_stream.readline()
+    except (OSError, KeyboardInterrupt):
+        print("\n未获得确认，删除已取消。", file=output_stream)
+        return False
+    approved = answer.strip().casefold() in {"y", "yes", "是"}
+    if not approved:
+        print("删除未获批准，已取消。", file=output_stream)
+    return approved
+
+
 def request_rollback_approval(
     preview: RollbackPreview,
     *,
@@ -195,6 +228,11 @@ def request_rollback_approval(
     if preview.deleted_paths:
         print(
             f"将删除本会话创建的文件：{', '.join(preview.deleted_paths)}",
+            file=output_stream,
+        )
+    if preview.created_paths:
+        print(
+            f"将恢复此前删除的文件：{', '.join(preview.created_paths)}",
             file=output_stream,
         )
     print(preview.diff, end="", file=output_stream)
@@ -231,11 +269,24 @@ def format_change_log(journal: ChangeJournal) -> str:
             if item.before_sha256 is not None
             else "（不存在）"
         )
-        kind = "创建" if item.kind is ChangeKind.CREATE else "替换"
-        detail = "创建文件" if item.kind is ChangeKind.CREATE else f"替换 {item.replacements} 处"
+        after_hash = (
+            item.after_sha256[:10]
+            if item.after_sha256 is not None
+            else "（不存在）"
+        )
+        kind = {
+            ChangeKind.CREATE: "创建",
+            ChangeKind.REPLACE: "替换",
+            ChangeKind.DELETE: "删除",
+        }[item.kind]
+        detail = {
+            ChangeKind.CREATE: "创建文件",
+            ChangeKind.REPLACE: f"替换 {item.replacements} 处",
+            ChangeKind.DELETE: "删除文件",
+        }[item.kind]
         lines.append(
             f"  #{item.change_id} [{status}][{kind}] {item.path}；"
-            f"SHA-256 {before_hash} -> {item.after_sha256[:10]}；{detail}"
+            f"SHA-256 {before_hash} -> {after_hash}；{detail}"
         )
     pending_paths = journal.pending_rollback_paths
     if pending_paths:
@@ -447,6 +498,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.workspace,
             replacement_approval=request_replacement_approval,
             creation_approval=request_creation_approval,
+            deletion_approval=request_deletion_approval,
             change_journal=change_journal,
             rollback_approval=request_rollback_approval,
         )

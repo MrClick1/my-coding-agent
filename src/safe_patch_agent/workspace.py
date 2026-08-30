@@ -51,6 +51,18 @@ CreationApproval = Callable[[CreationPreview], bool]
 
 
 @dataclass(frozen=True)
+class DeletionPreview:
+    """等待用户确认的一次现有文件删除预览。"""
+
+    path: str
+    diff: str
+    original_bytes: int
+
+
+DeletionApproval = Callable[[DeletionPreview], bool]
+
+
+@dataclass(frozen=True)
 class RollbackPreview:
     """等待用户确认的一次会话修改回滚预览。"""
 
@@ -60,6 +72,7 @@ class RollbackPreview:
     original_bytes: int
     updated_bytes: int
     deleted_paths: tuple[str, ...] = ()
+    created_paths: tuple[str, ...] = ()
 
 
 RollbackApproval = Callable[[RollbackPreview], bool]
@@ -139,6 +152,7 @@ class SafeWorkspace:
         *,
         replacement_approval: ReplacementApproval | None = None,
         creation_approval: CreationApproval | None = None,
+        deletion_approval: DeletionApproval | None = None,
         change_journal: ChangeJournal | None = None,
         rollback_approval: RollbackApproval | None = None,
     ) -> None:
@@ -151,11 +165,14 @@ class SafeWorkspace:
             raise WorkspaceError("replacement_approval 必须是可调用对象")
         if creation_approval is not None and not callable(creation_approval):
             raise WorkspaceError("creation_approval 必须是可调用对象")
+        if deletion_approval is not None and not callable(deletion_approval):
+            raise WorkspaceError("deletion_approval 必须是可调用对象")
         if rollback_approval is not None and not callable(rollback_approval):
             raise WorkspaceError("rollback_approval 必须是可调用对象")
         self.root = resolved_root
         self.replacement_approval = replacement_approval
         self.creation_approval = creation_approval
+        self.deletion_approval = deletion_approval
         self.change_journal = change_journal
         self.rollback_approval = rollback_approval
 
@@ -624,6 +641,64 @@ class SafeWorkspace:
             "updated_bytes": len(content_bytes),
         }
 
+    def delete_file(self, path: str) -> dict[str, Any]:
+        """完整预览并确认后，删除内容未发生变化的 UTF-8 文件。"""
+
+        display_path = self.canonical_file_path(path)
+        target = self.resolve(display_path)
+        original_text, original_bytes = self._read_utf8_text(target, display_path)
+        if "\x00" in original_text:
+            raise WorkspaceError(f"文件包含 NUL 字符，拒绝按文本删除：{display_path}")
+
+        diff = self._deletion_diff(display_path, original_text)
+        if len(diff) > self._MAX_PATCH_PREVIEW_CHARS:
+            raise WorkspaceError(
+                "删除预览超过 "
+                f"{self._MAX_PATCH_PREVIEW_CHARS} 字符上限，无法完整展示；文件未删除"
+            )
+        if self.change_journal is not None:
+            try:
+                self.change_journal.ensure_can_record(original_text, None)
+            except ChangeJournalError as exc:
+                raise WorkspaceError(str(exc).replace("文件未修改", "文件未删除")) from exc
+        preview = DeletionPreview(
+            path=display_path,
+            diff=diff,
+            original_bytes=original_bytes,
+        )
+        if self.deletion_approval is None:
+            raise WorkspaceError("未配置用户确认，拒绝删除文件")
+        try:
+            approved = self.deletion_approval(preview)
+        except Exception as exc:
+            raise WorkspaceError("无法获得用户确认；文件未删除") from exc
+        if approved is not True:
+            raise WorkspaceError("用户拒绝了删除；文件未删除")
+
+        current_text, current_bytes = self._read_utf8_text(target, display_path)
+        if current_bytes != original_bytes or current_text != original_text:
+            raise WorkspaceError(
+                "文件在确认期间发生变化；为避免删除新内容，已取消删除"
+            )
+
+        self._checked_delete(target, original_text.encode("utf-8"))
+        change_id: int | None = None
+        if self.change_journal is not None:
+            change_id = self.change_journal.record_deletion(
+                path=display_path,
+                before_text=original_text,
+                diff=diff,
+            ).change_id
+        return {
+            "ok": True,
+            "path": display_path,
+            "approved": True,
+            "deleted": True,
+            "change_id": change_id,
+            "diff": diff,
+            "original_bytes": original_bytes,
+        }
+
     def rollback_changes(
         self,
         target: int | str | None = None,
@@ -637,19 +712,23 @@ class SafeWorkspace:
         except ChangeJournalError as exc:
             raise WorkspaceError(str(exc)) from exc
 
-        current_texts: dict[str, str] = {}
+        current_texts: dict[str, str | None] = {}
         current_bytes: dict[str, int] = {}
         targets: dict[str, Path] = {}
         for record in records:
-            if record.path in current_texts:
+            if record.path in targets:
                 continue
-            resolved = self.resolve(record.path)
-            if not resolved.is_file():
-                raise WorkspaceError(f"回滚目标不是文件：{record.path}")
-            text, byte_count = self._read_utf8_text(resolved, record.path)
+            resolved = self.resolve(record.path, must_exist=False)
             targets[record.path] = resolved
-            current_texts[record.path] = text
-            current_bytes[record.path] = byte_count
+            if os.path.lexists(resolved):
+                if not resolved.is_file():
+                    raise WorkspaceError(f"回滚目标不是文件：{record.path}")
+                text, byte_count = self._read_utf8_text(resolved, record.path)
+                current_texts[record.path] = text
+                current_bytes[record.path] = byte_count
+            else:
+                current_texts[record.path] = None
+                current_bytes[record.path] = 0
 
         restored_texts: dict[str, str | None] = dict(current_texts)
         for record in records:
@@ -662,14 +741,18 @@ class SafeWorkspace:
 
         diffs = []
         for path in sorted(restored_texts, key=str.casefold):
+            current = current_texts[path]
             restored = restored_texts[path]
-            if restored is None:
-                diffs.append(self._deletion_diff(path, current_texts[path]))
+            if current == restored:
+                continue
+            if current is None:
+                assert restored is not None
+                diffs.append(self._creation_diff(path, restored))
+            elif restored is None:
+                diffs.append(self._deletion_diff(path, current))
             else:
-                diffs.append(
-                    self._replacement_diff(path, current_texts[path], restored)
-                )
-        diff = "".join(diffs)
+                diffs.append(self._replacement_diff(path, current, restored))
+        diff = "".join(diffs) or "（所选修改的净文件状态不变）\n"
         if len(diff) > self._MAX_PATCH_PREVIEW_CHARS:
             raise WorkspaceError(
                 "回滚预览超过 "
@@ -682,7 +765,21 @@ class SafeWorkspace:
         }
         deleted_paths = tuple(
             sorted(
-                (path for path, text in restored_texts.items() if text is None),
+                (
+                    path
+                    for path, text in restored_texts.items()
+                    if current_texts[path] is not None and text is None
+                ),
+                key=str.casefold,
+            )
+        )
+        created_paths = tuple(
+            sorted(
+                (
+                    path
+                    for path, text in restored_texts.items()
+                    if current_texts[path] is None and text is not None
+                ),
                 key=str.casefold,
             )
         )
@@ -693,6 +790,7 @@ class SafeWorkspace:
             original_bytes=sum(current_bytes.values()),
             updated_bytes=sum(len(content) for content in encoded_restored.values()),
             deleted_paths=deleted_paths,
+            created_paths=created_paths,
         )
         if self.rollback_approval is None:
             raise WorkspaceError("未配置用户确认，拒绝回滚文件")
@@ -704,8 +802,20 @@ class SafeWorkspace:
             raise WorkspaceError("用户拒绝了回滚；文件未修改")
 
         for path, resolved in targets.items():
+            expected_text = current_texts[path]
+            if expected_text is None:
+                if os.path.lexists(resolved):
+                    raise WorkspaceError(
+                        f"文件 {path} 在确认期间被重新创建；"
+                        "为避免覆盖新内容，已取消回滚"
+                    )
+                continue
+            if not os.path.lexists(resolved) or not resolved.is_file():
+                raise WorkspaceError(
+                    f"文件 {path} 在确认期间被删除或替换；已取消回滚"
+                )
             text, byte_count = self._read_utf8_text(resolved, path)
-            if text != current_texts[path] or byte_count != current_bytes[path]:
+            if text != expected_text or byte_count != current_bytes[path]:
                 raise WorkspaceError(
                     f"文件 {path} 在确认期间发生变化；"
                     "为避免覆盖新内容，已取消回滚"
@@ -714,13 +824,15 @@ class SafeWorkspace:
         written_paths: list[str] = []
         try:
             for path in sorted(targets, key=str.casefold):
-                if restored_texts[path] is None:
-                    try:
-                        targets[path].unlink()
-                    except OSError as exc:
-                        raise WorkspaceError(
-                            f"无法安全删除创建文件：{path}"
-                        ) from exc
+                current = current_texts[path]
+                restored = restored_texts[path]
+                if current == restored:
+                    continue
+                if restored is None:
+                    assert current is not None
+                    self._checked_delete(targets[path], current.encode("utf-8"))
+                elif current is None:
+                    self._exclusive_write(targets[path], encoded_restored[path])
                 else:
                     self._atomic_write(targets[path], encoded_restored[path])
                 written_paths.append(path)
@@ -728,11 +840,29 @@ class SafeWorkspace:
             restore_failed = False
             for path in reversed(written_paths):
                 try:
-                    original_content = current_texts[path].encode("utf-8")
-                    if targets[path].exists():
-                        self._atomic_write(targets[path], original_content)
+                    original_text = current_texts[path]
+                    if original_text is None:
+                        restored_text = restored_texts[path]
+                        assert restored_text is not None
+                        if os.path.lexists(targets[path]):
+                            self._checked_delete(
+                                targets[path],
+                                restored_text.encode("utf-8"),
+                            )
+                    elif os.path.lexists(targets[path]):
+                        if not targets[path].is_file():
+                            raise WorkspaceError(
+                                f"无法恢复回滚前文件：{path}"
+                            )
+                        self._atomic_write(
+                            targets[path],
+                            original_text.encode("utf-8"),
+                        )
                     else:
-                        self._exclusive_write(targets[path], original_content)
+                        self._exclusive_write(
+                            targets[path],
+                            original_text.encode("utf-8"),
+                        )
                 except WorkspaceError:
                     restore_failed = True
             if restore_failed:
@@ -748,6 +878,7 @@ class SafeWorkspace:
             "change_ids": tuple(record.change_id for record in records),
             "paths": tuple(sorted(restored_texts, key=str.casefold)),
             "deleted_paths": deleted_paths,
+            "created_paths": created_paths,
             "diff": diff,
         }
 
@@ -976,6 +1107,85 @@ class SafeWorkspace:
                     temporary_path.unlink(missing_ok=True)
                 except OSError:
                     pass
+
+    @staticmethod
+    def _checked_delete(target: Path, expected_content: bytes) -> None:
+        """先原子移入同目录隔离文件，核对内容后再完成删除。"""
+
+        descriptor: int | None = None
+        quarantine_path: Path | None = None
+        moved = False
+        try:
+            descriptor, quarantine_name = tempfile.mkstemp(
+                prefix=f".{target.name}.",
+                suffix=".delete",
+                dir=target.parent,
+            )
+            quarantine_path = Path(quarantine_name)
+            os.close(descriptor)
+            descriptor = None
+            quarantine_path.unlink()
+
+            os.replace(target, quarantine_path)
+            moved = True
+            try:
+                mode = quarantine_path.lstat().st_mode
+                actual_content = (
+                    quarantine_path.read_bytes() if stat.S_ISREG(mode) else None
+                )
+            except OSError as exc:
+                SafeWorkspace._restore_quarantined_file(quarantine_path, target)
+                moved = False
+                raise WorkspaceError(
+                    f"删除时无法核对文件内容，已恢复：{target.name}"
+                ) from exc
+            if actual_content != expected_content:
+                SafeWorkspace._restore_quarantined_file(quarantine_path, target)
+                moved = False
+                raise WorkspaceError(
+                    f"文件在删除提交时发生变化，已恢复：{target.name}"
+                )
+            try:
+                quarantine_path.unlink()
+            except OSError as exc:
+                SafeWorkspace._restore_quarantined_file(quarantine_path, target)
+                moved = False
+                raise WorkspaceError(
+                    f"无法安全删除文件，已恢复：{target.name}"
+                ) from exc
+            moved = False
+            quarantine_path = None
+        except WorkspaceError:
+            raise
+        except OSError as exc:
+            if moved and quarantine_path is not None:
+                try:
+                    SafeWorkspace._restore_quarantined_file(quarantine_path, target)
+                    moved = False
+                except WorkspaceError as restore_exc:
+                    raise restore_exc from exc
+            raise WorkspaceError(f"无法安全删除文件：{target.name}") from exc
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            if not moved and quarantine_path is not None:
+                try:
+                    quarantine_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _restore_quarantined_file(quarantine_path: Path, target: Path) -> None:
+        """不覆盖并发目标地恢复隔离文件，恢复失败时保留隔离副本。"""
+
+        try:
+            os.link(quarantine_path, target, follow_symlinks=False)
+            quarantine_path.unlink()
+        except OSError as exc:
+            raise WorkspaceError(
+                "删除过程中检测到并发变化，且无法把原文件恢复到原路径；"
+                f"隔离副本保留为 {quarantine_path.name}"
+            ) from exc
 
     @classmethod
     def _sanitized_test_environment(cls) -> dict[str, str]:
@@ -1244,7 +1454,7 @@ def build_read_only_registry(workspace: SafeWorkspace) -> ToolRegistry:
 
 
 def build_agent_registry(workspace: SafeWorkspace) -> ToolRegistry:
-    """创建包含受控精确修改与文件创建能力的 Agent 工具注册表。"""
+    """创建包含受控创建、精确修改与删除能力的 Agent 工具注册表。"""
 
     registry = build_read_only_registry(workspace)
     registry.register(
@@ -1316,6 +1526,31 @@ def build_agent_registry(workspace: SafeWorkspace) -> ToolRegistry:
             file_access=ToolFileAccess.CREATE,
             path_argument="path",
             path_normalizer=workspace.canonical_new_file_path,
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="delete_file",
+            description=(
+                "删除已经读取的 UTF-8 文本文件。删除前会向用户展示完整"
+                " diff 并要求确认；确认期间内容发生变化时会安全取消。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "要删除的工作区相对文件路径。",
+                        "minLength": 1,
+                    },
+                },
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+            handler=workspace.delete_file,
+            file_access=ToolFileAccess.DELETE,
+            path_argument="path",
+            path_normalizer=workspace.canonical_file_path,
         )
     )
     registry.register(

@@ -176,6 +176,61 @@ class ToolingTests(unittest.TestCase):
         self.assertEqual(snapshot.blocked_write_attempts, 0)
         self.assertTrue(snapshot.has_unverified_changes)
 
+    def test_delete_tool_requires_read_and_activates_test_gate(self) -> None:
+        deleted: list[str] = []
+        registry = ToolRegistry()
+        registry.register(
+            ToolDefinition(
+                "read_file",
+                "读取",
+                {"type": "object"},
+                lambda path: {"ok": True, "path": path},
+                file_access=ToolFileAccess.READ,
+                path_argument="path",
+            )
+        )
+        registry.register(
+            ToolDefinition(
+                "delete_file",
+                "删除",
+                {"type": "object"},
+                lambda path: deleted.append(path) or {"ok": True, "path": path},
+                file_access=ToolFileAccess.DELETE,
+                path_argument="path",
+            )
+        )
+
+        blocked = json.loads(
+            registry.execute(
+                ToolCall(
+                    id="blocked-delete",
+                    name="delete_file",
+                    arguments={"path": "old.py"},
+                )
+            )
+        )
+        registry.execute(
+            ToolCall(id="read", name="read_file", arguments={"path": "old.py"})
+        )
+        deleted_result = json.loads(
+            registry.execute(
+                ToolCall(
+                    id="delete",
+                    name="delete_file",
+                    arguments={"path": "old.py"},
+                )
+            )
+        )
+
+        self.assertFalse(blocked["ok"])
+        self.assertTrue(deleted_result["ok"])
+        self.assertEqual(deleted, ["old.py"])
+        snapshot = registry.state.snapshot()
+        self.assertEqual(snapshot.read_files, ("old.py",))
+        self.assertEqual(snapshot.modified_files, ("old.py",))
+        self.assertEqual(snapshot.blocked_write_attempts, 1)
+        self.assertTrue(snapshot.has_unverified_changes)
+
     def test_file_access_metadata_must_be_complete(self) -> None:
         with self.assertRaisesRegex(ToolRegistrationError, "同时配置"):
             ToolDefinition(

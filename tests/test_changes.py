@@ -47,6 +47,24 @@ class ChangeJournalTests(unittest.TestCase):
         self.assertEqual(record.original_bytes, 0)
         self.assertEqual(record.updated_bytes, len(b"value = 1\n"))
 
+    def test_deletion_record_represents_missing_result_file(self) -> None:
+        journal = ChangeJournal()
+
+        record = journal.record_deletion(
+            path="old.py",
+            before_text="value = 1\n",
+            diff="-value = 1\n",
+        )
+        summary = journal.summaries()[0]
+
+        self.assertIs(record.kind, ChangeKind.DELETE)
+        self.assertEqual(record.before_text, "value = 1\n")
+        self.assertIsNone(record.after_text)
+        self.assertIsNotNone(summary.before_sha256)
+        self.assertIsNone(summary.after_sha256)
+        self.assertEqual(record.original_bytes, len(b"value = 1\n"))
+        self.assertEqual(record.updated_bytes, 0)
+
     def test_latest_test_result_updates_all_active_changes(self) -> None:
         journal = ChangeJournal()
         first = journal.record(

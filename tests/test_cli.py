@@ -17,12 +17,14 @@ from safe_patch_agent.cli import (
     main,
     parse_rollback_target,
     request_creation_approval,
+    request_deletion_approval,
     request_replacement_approval,
     request_rollback_approval,
     run_chat,
 )
 from safe_patch_agent.workspace import (
     CreationPreview,
+    DeletionPreview,
     ReplacementPreview,
     RollbackPreview,
     SafeWorkspace,
@@ -189,6 +191,38 @@ class CLITests(unittest.TestCase):
         self.assertFalse(approved)
         self.assertIn("不是交互式终端", output.getvalue())
 
+    def test_deletion_approval_shows_full_diff_and_requires_explicit_yes(self) -> None:
+        preview = DeletionPreview(
+            path="src/old.py",
+            diff="--- a/src/old.py\n+++ /dev/null\n-value = 1\n",
+            original_bytes=10,
+        )
+        output = StringIO()
+
+        approved = request_deletion_approval(
+            preview,
+            input_stream=InteractiveStringIO("是\n"),
+            output_stream=output,
+        )
+
+        self.assertTrue(approved)
+        self.assertIn("SafePatch 文件删除预览", output.getvalue())
+        self.assertIn("src/old.py", output.getvalue())
+        self.assertIn("+++ /dev/null", output.getvalue())
+
+    def test_non_interactive_input_cannot_approve_deletion(self) -> None:
+        preview = DeletionPreview("old.py", "-old\n", 4)
+        output = StringIO()
+
+        approved = request_deletion_approval(
+            preview,
+            input_stream=StringIO("yes\n"),
+            output_stream=output,
+        )
+
+        self.assertFalse(approved)
+        self.assertIn("不是交互式终端", output.getvalue())
+
     def test_rollback_approval_shows_ids_paths_and_reverse_diff(self) -> None:
         preview = RollbackPreview(
             change_ids=(2, 1),
@@ -197,6 +231,7 @@ class CLITests(unittest.TestCase):
             original_bytes=4,
             updated_bytes=4,
             deleted_paths=("demo.py",),
+            created_paths=("old.py",),
         )
         output = StringIO()
 
@@ -211,6 +246,7 @@ class CLITests(unittest.TestCase):
         self.assertIn("#2, #1", output.getvalue())
         self.assertIn("-new\n+old", output.getvalue())
         self.assertIn("将删除本会话创建的文件：demo.py", output.getvalue())
+        self.assertIn("将恢复此前删除的文件：old.py", output.getvalue())
 
     def test_change_log_and_rollback_target_formatting(self) -> None:
         journal = ChangeJournal()
@@ -234,6 +270,12 @@ class CLITests(unittest.TestCase):
             after_text="value = 1\n",
             diff="diff",
         )
+        deleted = ChangeJournal()
+        deleted.record_deletion(
+            path="old.py",
+            before_text="value = 1\n",
+            diff="diff",
+        )
 
         self.assertIn("#1 [待测试][替换] demo.py", pending)
         self.assertIn("[测试通过]", tested)
@@ -241,6 +283,8 @@ class CLITests(unittest.TestCase):
         self.assertIn("回滚结果待测试：demo.py", rolled_back)
         self.assertIn("[创建] new.py", format_change_log(created))
         self.assertIn("SHA-256 （不存在）", format_change_log(created))
+        self.assertIn("[删除] old.py", format_change_log(deleted))
+        self.assertIn("-> （不存在）", format_change_log(deleted))
         self.assertIsNone(parse_rollback_target("/rollback"))
         self.assertEqual(parse_rollback_target("/rollback 3"), 3)
         self.assertEqual(parse_rollback_target("/rollback ALL"), "all")

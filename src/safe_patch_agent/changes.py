@@ -17,6 +17,7 @@ class ChangeKind(StrEnum):
 
     REPLACE = "replace"
     CREATE = "create"
+    DELETE = "delete"
 
 
 @dataclass
@@ -29,14 +30,14 @@ class ChangeRecord:
     replacements: int
     diff: str
     before_sha256: str | None
-    after_sha256: str
+    after_sha256: str | None
     original_bytes: int
     updated_bytes: int
     created_at: str
     test_passed: bool | None = None
     rolled_back: bool = False
     before_text: str | None = field(default=None, repr=False)
-    after_text: str = field(default="", repr=False)
+    after_text: str | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -48,7 +49,7 @@ class ChangeSummary:
     path: str
     replacements: int
     before_sha256: str | None
-    after_sha256: str
+    after_sha256: str | None
     created_at: str
     test_passed: bool | None
     rolled_back: bool
@@ -91,7 +92,11 @@ class ChangeJournal:
     def pending_rollback_paths(self) -> tuple[str, ...]:
         return tuple(sorted(self._pending_rollback_paths, key=str.casefold))
 
-    def ensure_can_record(self, before_text: str | None, after_text: str) -> None:
+    def ensure_can_record(
+        self,
+        before_text: str | None,
+        after_text: str | None,
+    ) -> None:
         """在写文件前确认日志能够完整保存可回滚内容。"""
 
         if len(self._records) >= self.max_records:
@@ -110,7 +115,7 @@ class ChangeJournal:
         *,
         path: str,
         before_text: str | None,
-        after_text: str,
+        after_text: str | None,
         diff: str,
         replacements: int,
         kind: ChangeKind = ChangeKind.REPLACE,
@@ -125,8 +130,16 @@ class ChangeJournal:
                 raise ChangeJournalError("修改日志 kind 无效") from exc
         if kind is ChangeKind.CREATE and before_text is not None:
             raise ChangeJournalError("创建记录的 before_text 必须是 None")
-        if kind is ChangeKind.REPLACE and before_text is None:
-            raise ChangeJournalError("替换记录必须包含 before_text")
+        if kind is ChangeKind.CREATE and after_text is None:
+            raise ChangeJournalError("创建记录必须包含 after_text")
+        if kind is ChangeKind.DELETE and before_text is None:
+            raise ChangeJournalError("删除记录必须包含 before_text")
+        if kind is ChangeKind.DELETE and after_text is not None:
+            raise ChangeJournalError("删除记录的 after_text 必须是 None")
+        if kind is ChangeKind.REPLACE and (
+            before_text is None or after_text is None
+        ):
+            raise ChangeJournalError("替换记录必须包含 before_text 和 after_text")
         required_bytes = _encoded_size(before_text) + _encoded_size(after_text)
         record = ChangeRecord(
             change_id=self._next_id,
@@ -135,7 +148,7 @@ class ChangeJournal:
             replacements=replacements,
             diff=diff,
             before_sha256=_sha256(before_text) if before_text is not None else None,
-            after_sha256=_sha256(after_text),
+            after_sha256=_sha256(after_text) if after_text is not None else None,
             original_bytes=_encoded_size(before_text),
             updated_bytes=_encoded_size(after_text),
             created_at=datetime.now(UTC).isoformat(timespec="seconds"),
@@ -163,6 +176,24 @@ class ChangeJournal:
             diff=diff,
             replacements=0,
             kind=ChangeKind.CREATE,
+        )
+
+    def record_deletion(
+        self,
+        *,
+        path: str,
+        before_text: str,
+        diff: str,
+    ) -> ChangeRecord:
+        """记录一次成功删除的现有文件。"""
+
+        return self.record(
+            path=path,
+            before_text=before_text,
+            after_text=None,
+            diff=diff,
+            replacements=0,
+            kind=ChangeKind.DELETE,
         )
 
     def summaries(self) -> tuple[ChangeSummary, ...]:

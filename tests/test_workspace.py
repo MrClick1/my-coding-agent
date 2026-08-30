@@ -11,6 +11,7 @@ from safe_patch_agent.changes import ChangeJournal, ChangeKind
 from safe_patch_agent.messages import ToolCall
 from safe_patch_agent.workspace import (
     CreationPreview,
+    DeletionPreview,
     ReplacementPreview,
     RollbackPreview,
     SafeWorkspace,
@@ -527,6 +528,140 @@ class WorkspaceTests(unittest.TestCase):
 
         self.assertEqual(target.read_text(encoding="utf-8"), "external\n")
 
+    def test_delete_file_previews_checks_and_records_deletion(self) -> None:
+        target = self.root / "obsolete.py"
+        target.write_text("value = 1\n", encoding="utf-8")
+        expected_bytes = len(target.read_bytes())
+        previews: list[DeletionPreview] = []
+        journal = ChangeJournal()
+        workspace = SafeWorkspace(
+            self.root,
+            deletion_approval=lambda preview: previews.append(preview) is None,
+            change_journal=journal,
+        )
+
+        result = workspace.delete_file("obsolete.py")
+
+        self.assertFalse(target.exists())
+        self.assertTrue(result["deleted"])
+        self.assertEqual(result["change_id"], 1)
+        self.assertEqual(previews[0].path, "obsolete.py")
+        self.assertEqual(previews[0].original_bytes, expected_bytes)
+        self.assertIn("--- a/obsolete.py", previews[0].diff)
+        self.assertIn("+++ /dev/null", previews[0].diff)
+        self.assertIn("-value = 1", previews[0].diff)
+        summary = journal.summaries()[0]
+        self.assertIs(summary.kind, ChangeKind.DELETE)
+        self.assertIsNone(summary.after_sha256)
+
+    def test_delete_file_requires_approval_and_honors_rejection(self) -> None:
+        target = self.root / "obsolete.py"
+        target.write_text("value = 1\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(WorkspaceError, "未配置用户确认"):
+            self.workspace.delete_file("obsolete.py")
+
+        workspace = SafeWorkspace(
+            self.root,
+            deletion_approval=lambda _preview: False,
+        )
+        with self.assertRaisesRegex(WorkspaceError, "用户拒绝"):
+            workspace.delete_file("obsolete.py")
+
+        self.assertEqual(target.read_text(encoding="utf-8"), "value = 1\n")
+
+    def test_delete_file_rejects_invalid_or_unpreviewable_text(self) -> None:
+        binary = self.root / "binary.dat"
+        binary.write_bytes(b"bad\x00content")
+        large = self.root / "large.txt"
+        large.write_bytes(b"x" * 1_000_001)
+        long_diff = self.root / "long.txt"
+        long_diff.write_text("value = 1\n", encoding="utf-8")
+        approval_called = False
+
+        def approve(_preview: DeletionPreview) -> bool:
+            nonlocal approval_called
+            approval_called = True
+            return True
+
+        workspace = SafeWorkspace(self.root, deletion_approval=approve)
+
+        with self.assertRaisesRegex(WorkspaceError, "NUL"):
+            workspace.delete_file("binary.dat")
+        with self.assertRaisesRegex(WorkspaceError, "读取上限"):
+            workspace.delete_file("large.txt")
+        with (
+            patch.object(SafeWorkspace, "_MAX_PATCH_PREVIEW_CHARS", 10),
+            self.assertRaisesRegex(WorkspaceError, "无法完整展示"),
+        ):
+            workspace.delete_file("long.txt")
+
+        self.assertFalse(approval_called)
+        self.assertTrue(binary.exists())
+        self.assertTrue(large.exists())
+        self.assertTrue(long_diff.exists())
+
+    def test_delete_file_checks_journal_capacity_before_approval(self) -> None:
+        target = self.root / "obsolete.py"
+        target.write_text("value = 1\n", encoding="utf-8")
+        approval_called = False
+
+        def approve(_preview: DeletionPreview) -> bool:
+            nonlocal approval_called
+            approval_called = True
+            return True
+
+        workspace = SafeWorkspace(
+            self.root,
+            deletion_approval=approve,
+            change_journal=ChangeJournal(max_stored_bytes=1),
+        )
+
+        with self.assertRaisesRegex(WorkspaceError, "可回滚内容"):
+            workspace.delete_file("obsolete.py")
+
+        self.assertFalse(approval_called)
+        self.assertTrue(target.exists())
+
+    def test_delete_file_rejects_content_changed_during_approval(self) -> None:
+        target = self.root / "obsolete.py"
+        target.write_text("agent\n", encoding="utf-8")
+
+        def change_during_approval(_preview: DeletionPreview) -> bool:
+            target.write_text("external\n", encoding="utf-8")
+            return True
+
+        workspace = SafeWorkspace(
+            self.root,
+            deletion_approval=change_during_approval,
+        )
+
+        with self.assertRaisesRegex(WorkspaceError, "确认期间发生变化"):
+            workspace.delete_file("obsolete.py")
+
+        self.assertEqual(target.read_text(encoding="utf-8"), "external\n")
+
+    def test_checked_delete_restores_file_that_changes_in_final_race(self) -> None:
+        target = self.root / "obsolete.py"
+        target.write_text("agent\n", encoding="utf-8")
+        workspace = SafeWorkspace(
+            self.root,
+            deletion_approval=lambda _preview: True,
+        )
+        real_replace = os.replace
+
+        def competing_replace(source: Path, destination: Path) -> None:
+            target.write_text("external\n", encoding="utf-8")
+            real_replace(source, destination)
+
+        with (
+            patch("safe_patch_agent.workspace.os.replace", side_effect=competing_replace),
+            self.assertRaisesRegex(WorkspaceError, "删除提交时发生变化"),
+        ):
+            workspace.delete_file("obsolete.py")
+
+        self.assertEqual(target.read_text(encoding="utf-8"), "external\n")
+
     def test_rollback_latest_restores_content_after_confirmation(self) -> None:
         target = self.root / "replace.py"
         target.write_text("old\n", encoding="utf-8")
@@ -575,6 +710,68 @@ class WorkspaceTests(unittest.TestCase):
         self.assertIn("-value = 1", previews[0].diff)
         self.assertIn("+++ /dev/null", previews[0].diff)
         self.assertTrue(journal.summaries()[0].rolled_back)
+
+    def test_rollback_deletion_recreates_only_the_still_missing_file(self) -> None:
+        target = self.root / "obsolete.py"
+        target.write_text("value = 1\n", encoding="utf-8")
+        previews: list[RollbackPreview] = []
+        journal = ChangeJournal()
+        workspace = SafeWorkspace(
+            self.root,
+            deletion_approval=lambda _preview: True,
+            change_journal=journal,
+            rollback_approval=lambda preview: previews.append(preview) is None,
+        )
+        workspace.delete_file("obsolete.py")
+
+        result = workspace.rollback_changes()
+
+        self.assertEqual(target.read_text(encoding="utf-8"), "value = 1\n")
+        self.assertEqual(result["created_paths"], ("obsolete.py",))
+        self.assertEqual(previews[0].created_paths, ("obsolete.py",))
+        self.assertIn("--- /dev/null", previews[0].diff)
+        self.assertIn("+++ b/obsolete.py", previews[0].diff)
+        self.assertTrue(journal.summaries()[0].rolled_back)
+
+    def test_rollback_deletion_rejects_externally_recreated_file(self) -> None:
+        target = self.root / "obsolete.py"
+        target.write_text("agent\n", encoding="utf-8")
+        journal = ChangeJournal()
+        workspace = SafeWorkspace(
+            self.root,
+            deletion_approval=lambda _preview: True,
+            change_journal=journal,
+            rollback_approval=lambda _preview: True,
+        )
+        workspace.delete_file("obsolete.py")
+        target.write_text("external\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(WorkspaceError, "已在修改后发生变化"):
+            workspace.rollback_changes()
+
+        self.assertEqual(target.read_text(encoding="utf-8"), "external\n")
+        self.assertFalse(journal.summaries()[0].rolled_back)
+
+    def test_rollback_all_of_create_then_delete_has_no_file_change(self) -> None:
+        journal = ChangeJournal()
+        previews: list[RollbackPreview] = []
+        workspace = SafeWorkspace(
+            self.root,
+            creation_approval=lambda _preview: True,
+            deletion_approval=lambda _preview: True,
+            change_journal=journal,
+            rollback_approval=lambda preview: previews.append(preview) is None,
+        )
+        workspace.create_file("temporary.py", "value = 1\n")
+        workspace.delete_file("temporary.py")
+
+        result = workspace.rollback_changes("all")
+
+        self.assertFalse((self.root / "temporary.py").exists())
+        self.assertEqual(result["deleted_paths"], ())
+        self.assertEqual(result["created_paths"], ())
+        self.assertIn("净文件状态不变", previews[0].diff)
+        self.assertTrue(all(item.rolled_back for item in journal.summaries()))
 
     def test_rollback_all_unwinds_replace_then_deletes_created_file(self) -> None:
         journal = ChangeJournal()
@@ -731,15 +928,15 @@ class WorkspaceTests(unittest.TestCase):
         )
         workspace.create_file("a.py", "created-a\n")
         workspace.create_file("b.py", "created-b\n")
-        original_unlink = Path.unlink
+        checked_delete = workspace._checked_delete
 
-        def fail_second_delete(path: Path, *args: object, **kwargs: object) -> None:
-            if path == second:
-                raise OSError("模拟删除失败")
-            original_unlink(path, *args, **kwargs)  # type: ignore[arg-type]
+        def fail_second_delete(target: Path, content: bytes) -> None:
+            if target == second:
+                raise WorkspaceError("模拟删除失败")
+            checked_delete(target, content)
 
         with (
-            patch.object(Path, "unlink", fail_second_delete),
+            patch.object(workspace, "_checked_delete", side_effect=fail_second_delete),
             self.assertRaisesRegex(WorkspaceError, "已恢复本次写入"),
         ):
             workspace.rollback_changes("all")
@@ -753,6 +950,8 @@ class WorkspaceTests(unittest.TestCase):
             SafeWorkspace(self.root, replacement_approval=True)  # type: ignore[arg-type]
         with self.assertRaisesRegex(WorkspaceError, "creation_approval"):
             SafeWorkspace(self.root, creation_approval=True)  # type: ignore[arg-type]
+        with self.assertRaisesRegex(WorkspaceError, "deletion_approval"):
+            SafeWorkspace(self.root, deletion_approval=True)  # type: ignore[arg-type]
 
     def test_replace_text_honors_rejection(self) -> None:
         target = self.root / "replace.py"
@@ -984,6 +1183,49 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(snapshot.blocked_write_attempts, 0)
         self.assertTrue(snapshot.has_unverified_changes)
 
+    def test_delete_file_registry_requires_read_and_records_write(self) -> None:
+        target = self.root / "obsolete.py"
+        target.write_text("value = 1\n", encoding="utf-8")
+        workspace = SafeWorkspace(
+            self.root,
+            deletion_approval=lambda _preview: True,
+        )
+        registry = build_agent_registry(workspace)
+
+        blocked = json.loads(
+            registry.execute(
+                ToolCall(
+                    id="blocked-delete",
+                    name="delete_file",
+                    arguments={"path": "obsolete.py"},
+                )
+            )
+        )
+        registry.execute(
+            ToolCall(
+                id="read",
+                name="read_file",
+                arguments={"path": "obsolete.py"},
+            )
+        )
+        deleted = json.loads(
+            registry.execute(
+                ToolCall(
+                    id="delete",
+                    name="delete_file",
+                    arguments={"path": "obsolete.py"},
+                )
+            )
+        )
+
+        self.assertFalse(blocked["ok"])
+        self.assertTrue(deleted["ok"])
+        self.assertFalse(target.exists())
+        snapshot = registry.state.snapshot()
+        self.assertEqual(snapshot.read_files, ("obsolete.py",))
+        self.assertEqual(snapshot.modified_files, ("obsolete.py",))
+        self.assertTrue(snapshot.has_unverified_changes)
+
     def test_agent_registry_exposes_replace_text_schema(self) -> None:
         registry = build_agent_registry(self.workspace)
         tool_names = {schema["function"]["name"] for schema in registry.schemas()}
@@ -997,6 +1239,11 @@ class WorkspaceTests(unittest.TestCase):
             for schema in registry.schemas()
             if schema["function"]["name"] == "create_file"
         )["function"]["parameters"]
+        delete_schema = next(
+            schema
+            for schema in registry.schemas()
+            if schema["function"]["name"] == "delete_file"
+        )["function"]["parameters"]
 
         self.assertEqual(
             tool_names,
@@ -1006,6 +1253,7 @@ class WorkspaceTests(unittest.TestCase):
                 "search_code",
                 "replace_text",
                 "create_file",
+                "delete_file",
                 "run_tests",
             },
         )
@@ -1019,6 +1267,7 @@ class WorkspaceTests(unittest.TestCase):
         )
         self.assertEqual(create_schema["required"], ["path", "content"])
         self.assertEqual(create_schema["properties"]["content"]["minLength"], 1)
+        self.assertEqual(delete_schema["required"], ["path"])
 
     def test_run_tests_uses_fixed_command_and_sanitized_environment(self) -> None:
         with (

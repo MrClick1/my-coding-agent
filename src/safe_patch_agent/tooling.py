@@ -26,6 +26,7 @@ class ToolFileAccess(StrEnum):
     READ = "read"
     WRITE = "write"
     CREATE = "create"
+    DELETE = "delete"
 
 
 @dataclass(frozen=True)
@@ -182,7 +183,7 @@ class ToolRegistry:
             path = definition.path_normalizer(path)
             if not isinstance(path, str) or not path:
                 raise ValueError("工具的路径规范化器必须返回非空字符串")
-        if definition.file_access is ToolFileAccess.WRITE:
+        if definition.file_access in {ToolFileAccess.WRITE, ToolFileAccess.DELETE}:
             self.state.require_file_read(path)
         return path
 
@@ -198,7 +199,7 @@ class ToolRegistry:
             return
         result_path = (
             requested_path
-            if definition.file_access is ToolFileAccess.WRITE
+            if definition.file_access in {ToolFileAccess.WRITE, ToolFileAccess.DELETE}
             or definition.path_normalizer is not None
             else payload.get("path", requested_path)
         )
@@ -206,7 +207,11 @@ class ToolRegistry:
             result_path = requested_path
         if definition.file_access is ToolFileAccess.READ:
             self.state.mark_file_read(result_path)
-        elif definition.file_access in {ToolFileAccess.WRITE, ToolFileAccess.CREATE}:
+        elif definition.file_access in {
+            ToolFileAccess.WRITE,
+            ToolFileAccess.CREATE,
+            ToolFileAccess.DELETE,
+        }:
             self.state.mark_file_modified(result_path)
 
     def _record_test_result(
