@@ -6,6 +6,7 @@ import difflib
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -94,6 +95,64 @@ class _PreparedChange:
 
 
 @dataclass(frozen=True)
+class _GitStatusEntry:
+    """从 Git porcelain 输出解析出的单项工作区状态。"""
+
+    code: str
+    path: str
+    original_path: str | None = None
+
+    @property
+    def untracked(self) -> bool:
+        return self.code == "??"
+
+    @property
+    def staged(self) -> bool:
+        return not self.untracked and self.code[0] != " "
+
+    @property
+    def unstaged(self) -> bool:
+        return not self.untracked and self.code[1] != " "
+
+    @property
+    def conflicted(self) -> bool:
+        return "U" in self.code or self.code in {"AA", "DD"}
+
+    @property
+    def kind(self) -> str:
+        if self.untracked:
+            return "untracked"
+        if self.conflicted:
+            return "conflicted"
+        for marker, kind in (
+            ("R", "renamed"),
+            ("C", "copied"),
+            ("D", "deleted"),
+            ("A", "added"),
+            ("M", "modified"),
+            ("T", "type_changed"),
+        ):
+            if marker in self.code:
+                return kind
+        return "changed"
+
+    def to_dict(self) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "path": self.path,
+            "kind": self.kind,
+            "index_status": self.code[0],
+            "worktree_status": self.code[1],
+            "staged": self.staged,
+            "unstaged": self.unstaged,
+            "untracked": self.untracked,
+            "conflicted": self.conflicted,
+        }
+        if self.original_path is not None:
+            result["original_path"] = self.original_path
+        return result
+
+
+@dataclass(frozen=True)
 class RollbackPreview:
     """等待用户确认的一次会话修改回滚预览。"""
 
@@ -127,6 +186,12 @@ class SafeWorkspace:
     _MAX_PATCH_PREVIEW_CHARS = 30_000
     _TEST_TIMEOUT_SECONDS = 120
     _MAX_TEST_OUTPUT_CHARS = 40_000
+    _GIT_TIMEOUT_SECONDS = 10
+    _MAX_GIT_PROCESS_OUTPUT_BYTES = 5_000_000
+    _MAX_GIT_STATUS_ENTRIES = 2_000
+    _MAX_GIT_STATUS_RESULTS = 200
+    _MAX_GIT_DIFF_PATHS = 100
+    _MAX_GIT_DIFF_CHARS = 40_000
     _SENSITIVE_ENV_MARKERS = (
         "ACCESS_KEY",
         "API_KEY",
@@ -1352,6 +1417,342 @@ class SafeWorkspace:
                 visible_lines.append("\n\\ 文件末尾无换行符\n")
         return "".join(visible_lines)
 
+    def git_status(self, max_results: int = 200) -> dict[str, Any]:
+        """返回仓库根目录内经过敏感路径过滤的只读 Git 状态。"""
+
+        if not isinstance(max_results, int) or isinstance(max_results, bool):
+            raise WorkspaceError("max_results 必须是整数")
+        if not 1 <= max_results <= self._MAX_GIT_STATUS_RESULTS:
+            raise WorkspaceError(
+                f"max_results 必须在 1 到 {self._MAX_GIT_STATUS_RESULTS} 之间"
+            )
+
+        self._assert_git_repository_root()
+        entries, hidden_entries = self._visible_git_status_entries()
+        branch, head = self._git_reference_state()
+        rendered_entries = entries[:max_results]
+        return {
+            "ok": True,
+            "repository_root": ".",
+            "branch": branch,
+            "head": head,
+            "detached": branch is None and head is not None,
+            "entries": [entry.to_dict() for entry in rendered_entries],
+            "counts": {
+                "total": len(entries),
+                "staged": sum(entry.staged for entry in entries),
+                "unstaged": sum(entry.unstaged for entry in entries),
+                "untracked": sum(entry.untracked for entry in entries),
+                "conflicted": sum(entry.conflicted for entry in entries),
+            },
+            "hidden_entries": hidden_entries,
+            "truncated": len(entries) > len(rendered_entries),
+        }
+
+    def git_diff(self, path: str | None = None) -> dict[str, Any]:
+        """比较可见的已跟踪改动与 HEAD，不显示未跟踪或敏感文件正文。"""
+
+        self._assert_git_repository_root()
+        if path is None:
+            scope_target = self.root
+            scope = "."
+        else:
+            scope_target = self.resolve(path, must_exist=False)
+            scope = self.display_path(scope_target)
+
+        entries, hidden_entries = self._visible_git_status_entries()
+        selected_entries = [
+            entry
+            for entry in entries
+            if self._git_entry_is_in_scope(entry, scope_target)
+        ]
+        tracked_entries = [entry for entry in selected_entries if not entry.untracked]
+        untracked_files = sum(entry.untracked for entry in selected_entries)
+        branch, head = self._git_reference_state()
+
+        if not tracked_entries:
+            return {
+                "ok": True,
+                "repository_root": ".",
+                "branch": branch,
+                "baseline": head,
+                "path": scope,
+                "changed_files": [],
+                "untracked_files": untracked_files,
+                "hidden_entries": hidden_entries,
+                "diff": "",
+                "output_truncated": False,
+            }
+        if head is None:
+            raise WorkspaceError("仓库还没有 HEAD 提交，无法生成基线差异")
+
+        pathspecs: list[str] = []
+        for entry in tracked_entries:
+            pathspecs.append(entry.path)
+            if entry.original_path is not None:
+                pathspecs.append(entry.original_path)
+        pathspecs = list(dict.fromkeys(pathspecs))
+        if len(pathspecs) > self._MAX_GIT_DIFF_PATHS:
+            raise WorkspaceError(
+                "可见变更文件过多；请使用 path 将 git_diff 限定到更小范围"
+            )
+
+        completed = self._invoke_read_only_git(
+            (
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--unified=3",
+                "HEAD",
+                "--",
+                *pathspecs,
+            )
+        )
+        if completed.returncode != 0:
+            raise WorkspaceError(self._git_failure_message(completed))
+        diff, output_truncated = self._truncate_git_diff(
+            self._decode_git_output(completed.stdout)
+        )
+        return {
+            "ok": True,
+            "repository_root": ".",
+            "branch": branch,
+            "baseline": head,
+            "path": scope,
+            "changed_files": [entry.path for entry in tracked_entries],
+            "untracked_files": untracked_files,
+            "hidden_entries": hidden_entries,
+            "diff": diff,
+            "output_truncated": output_truncated,
+        }
+
+    def _assert_git_repository_root(self) -> None:
+        """要求工作区正好是 Git 根目录，避免旁路读取父目录。"""
+
+        completed = self._invoke_read_only_git(("rev-parse", "--show-toplevel"))
+        if completed.returncode != 0:
+            raise WorkspaceError("工作区根目录不是 Git 仓库")
+        reported_root = self._decode_git_output(completed.stdout).strip()
+        if not reported_root:
+            raise WorkspaceError("Git 没有返回仓库根目录")
+        try:
+            repository_root = Path(reported_root).expanduser().resolve()
+        except OSError as exc:
+            raise WorkspaceError("无法解析 Git 仓库根目录") from exc
+        if repository_root != self.root:
+            raise WorkspaceError(
+                "工作区必须与 Git 仓库根目录一致，拒绝读取父级仓库"
+            )
+
+    def _visible_git_status_entries(
+        self,
+    ) -> tuple[list[_GitStatusEntry], int]:
+        completed = self._invoke_read_only_git(
+            ("status", "--porcelain=v1", "-z", "--untracked-files=normal")
+        )
+        if completed.returncode != 0:
+            raise WorkspaceError(self._git_failure_message(completed))
+        parsed_entries = self._parse_git_status(
+            self._decode_git_output(completed.stdout)
+        )
+        if len(parsed_entries) > self._MAX_GIT_STATUS_ENTRIES:
+            raise WorkspaceError(
+                f"Git 状态超过 {self._MAX_GIT_STATUS_ENTRIES} 项安全上限"
+            )
+
+        visible_entries: list[_GitStatusEntry] = []
+        hidden_entries = 0
+        for entry in parsed_entries:
+            normalized_path = self._normalize_git_reported_path(entry.path)
+            normalized_original = (
+                self._normalize_git_reported_path(entry.original_path)
+                if entry.original_path is not None
+                else None
+            )
+            if normalized_path is None or (
+                entry.original_path is not None and normalized_original is None
+            ):
+                hidden_entries += 1
+                continue
+            visible_entries.append(
+                _GitStatusEntry(entry.code, normalized_path, normalized_original)
+            )
+        return visible_entries, hidden_entries
+
+    @staticmethod
+    def _parse_git_status(output: str) -> list[_GitStatusEntry]:
+        """解析 ``git status --porcelain=v1 -z`` 的无歧义 NUL 格式。"""
+
+        fields = output.split("\x00")
+        if fields and fields[-1] == "":
+            fields.pop()
+        entries: list[_GitStatusEntry] = []
+        index = 0
+        while index < len(fields):
+            record = fields[index]
+            index += 1
+            if len(record) < 4 or record[2] != " ":
+                raise WorkspaceError("Git 返回了无法解析的状态数据")
+            code = record[:2]
+            path = record[3:]
+            original_path: str | None = None
+            if "R" in code or "C" in code:
+                if index >= len(fields):
+                    raise WorkspaceError("Git 返回了不完整的重命名状态")
+                original_path = fields[index]
+                index += 1
+            if not path or original_path == "":
+                raise WorkspaceError("Git 返回了空文件路径")
+            entries.append(_GitStatusEntry(code, path, original_path))
+        return entries
+
+    def _normalize_git_reported_path(self, path: str | None) -> str | None:
+        if path is None or not path or "\x00" in path:
+            return None
+        supplied = Path(path)
+        if supplied.is_absolute():
+            return None
+        candidate = (self.root / supplied).resolve(strict=False)
+        try:
+            candidate.relative_to(self.root)
+            self._assert_read_allowed(candidate)
+        except (OSError, ValueError):
+            return None
+        if candidate == self.root:
+            return None
+        return self.display_path(candidate)
+
+    def _git_entry_is_in_scope(
+        self,
+        entry: _GitStatusEntry,
+        scope_target: Path,
+    ) -> bool:
+        paths = (entry.path, entry.original_path)
+        for path in paths:
+            if path is None:
+                continue
+            candidate = (self.root / path).resolve(strict=False)
+            if candidate == scope_target or scope_target in candidate.parents:
+                return True
+        return False
+
+    def _git_reference_state(self) -> tuple[str | None, str | None]:
+        branch_result = self._invoke_read_only_git(
+            ("symbolic-ref", "--quiet", "--short", "HEAD")
+        )
+        branch = (
+            self._decode_git_output(branch_result.stdout).strip()
+            if branch_result.returncode == 0
+            else None
+        )
+        head_result = self._invoke_read_only_git(
+            ("rev-parse", "--verify", "--short=12", "HEAD")
+        )
+        head = (
+            self._decode_git_output(head_result.stdout).strip()
+            if head_result.returncode == 0
+            else None
+        )
+        return branch or None, head or None
+
+    def _invoke_read_only_git(
+        self,
+        arguments: tuple[str, ...],
+    ) -> subprocess.CompletedProcess[bytes]:
+        git_executable = self._find_git_executable()
+        command = [
+            git_executable,
+            "--no-pager",
+            "--literal-pathspecs",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "color.ui=false",
+            "-c",
+            "submodule.recurse=false",
+            *arguments,
+        ]
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=self.root,
+                env=self._sanitized_git_environment(),
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                shell=False,
+                check=False,
+                timeout=self._GIT_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise WorkspaceError("Git 只读检查超过时间上限") from exc
+        except OSError as exc:
+            raise WorkspaceError("无法启动系统 Git") from exc
+
+        output_bytes = len(self._git_output_bytes(completed.stdout)) + len(
+            self._git_output_bytes(completed.stderr)
+        )
+        if output_bytes > self._MAX_GIT_PROCESS_OUTPUT_BYTES:
+            raise WorkspaceError("Git 输出超过安全上限")
+        return completed
+
+    def _find_git_executable(self) -> str:
+        executable = shutil.which("git")
+        if executable is None:
+            raise WorkspaceError("系统 PATH 中没有可用的 Git")
+        resolved = Path(executable).expanduser().resolve()
+        try:
+            resolved.relative_to(self.root)
+        except ValueError:
+            return str(resolved)
+        raise WorkspaceError("拒绝执行工作区内部的 Git 程序")
+
+    @classmethod
+    def _sanitized_git_environment(cls) -> dict[str, str]:
+        environment = cls._sanitized_test_environment()
+        for name in tuple(environment):
+            if name.upper().startswith("GIT_"):
+                environment.pop(name, None)
+        environment.update(
+            {
+                "GIT_OPTIONAL_LOCKS": "0",
+                "GIT_PAGER": "cat",
+                "GIT_TERMINAL_PROMPT": "0",
+                "PAGER": "cat",
+            }
+        )
+        return environment
+
+    @staticmethod
+    def _git_output_bytes(output: str | bytes | None) -> bytes:
+        if output is None:
+            return b""
+        if isinstance(output, bytes):
+            return output
+        return output.encode("utf-8", errors="replace")
+
+    @classmethod
+    def _decode_git_output(cls, output: str | bytes | None) -> str:
+        return cls._git_output_bytes(output).decode("utf-8", errors="replace")
+
+    @classmethod
+    def _git_failure_message(
+        cls,
+        completed: subprocess.CompletedProcess[bytes],
+    ) -> str:
+        detail = cls._decode_git_output(completed.stderr).strip()
+        if detail:
+            return f"Git 只读检查失败：{detail[:500]}"
+        return f"Git 只读检查失败，退出码 {completed.returncode}"
+
+    @classmethod
+    def _truncate_git_diff(cls, diff: str) -> tuple[str, bool]:
+        if len(diff) <= cls._MAX_GIT_DIFF_CHARS:
+            return diff, False
+        marker = "\n... [Git 差异已截断] ...\n"
+        head_chars = cls._MAX_GIT_DIFF_CHARS // 2
+        tail_chars = cls._MAX_GIT_DIFF_CHARS - head_chars - len(marker)
+        return f"{diff[:head_chars]}{marker}{diff[-tail_chars:]}", True
+
     def run_tests(self) -> dict[str, Any]:
         """兼容入口：运行具名的 tests 验证任务。"""
 
@@ -1794,6 +2195,50 @@ def build_read_only_registry(workspace: SafeWorkspace) -> ToolRegistry:
     """创建只读代码检查工具注册表。"""
 
     registry = ToolRegistry()
+    registry.register(
+        ToolDefinition(
+            name="git_status",
+            description=(
+                "只读查看工作区 Git 分支、HEAD 以及暂存、未暂存和未跟踪状态。"
+                "工作区必须正好是仓库根目录；敏感路径和控制配置会被隐藏。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "max_results": {
+                        "type": "integer",
+                        "description": "最多返回多少项可见状态，取值范围为 1 到 200。",
+                        "default": 200,
+                        "minimum": 1,
+                        "maximum": SafeWorkspace._MAX_GIT_STATUS_RESULTS,
+                    },
+                },
+                "additionalProperties": False,
+            },
+            handler=workspace.git_status,
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="git_diff",
+            description=(
+                "只读查看可见已跟踪文件相对于 HEAD 的基线差异，包含暂存和未暂存"
+                "改动；可用 path 限定范围。不会显示未跟踪、敏感或控制配置的正文。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "可选的工作区相对文件或目录路径。",
+                        "minLength": 1,
+                    },
+                },
+                "additionalProperties": False,
+            },
+            handler=workspace.git_diff,
+        )
+    )
     registry.register(
         ToolDefinition(
             name="list_files",

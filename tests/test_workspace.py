@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import subprocess
 import sys
 import unittest
@@ -40,6 +41,32 @@ class WorkspaceTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
+
+    def run_git(
+        self,
+        *arguments: str,
+        cwd: Path | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        if shutil.which("git") is None:
+            self.skipTest("当前环境没有 Git")
+        return subprocess.run(
+            ["git", "--no-pager", *arguments],
+            cwd=cwd or self.root,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=True,
+        )
+
+    def initialize_git_repository(self) -> None:
+        self.run_git("init", "-q")
+        self.run_git("config", "user.name", "SafePatch Tests")
+        self.run_git("config", "user.email", "tests@example.invalid")
+        self.run_git("config", "core.autocrlf", "false")
+        self.run_git("add", "--", "README.md", "src/app.py")
+        self.run_git("-c", "commit.gpgsign=false", "commit", "-q", "-m", "baseline")
 
     def test_list_files_returns_relative_paths(self) -> None:
         result = self.workspace.list_files()
@@ -1547,6 +1574,16 @@ class WorkspaceTests(unittest.TestCase):
     def test_agent_registry_exposes_replace_text_schema(self) -> None:
         registry = build_agent_registry(self.workspace)
         tool_names = {schema["function"]["name"] for schema in registry.schemas()}
+        git_status_schema = next(
+            schema
+            for schema in registry.schemas()
+            if schema["function"]["name"] == "git_status"
+        )["function"]["parameters"]
+        git_diff_schema = next(
+            schema
+            for schema in registry.schemas()
+            if schema["function"]["name"] == "git_diff"
+        )["function"]["parameters"]
         replace_schema = next(
             schema
             for schema in registry.schemas()
@@ -1576,6 +1613,8 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(
             tool_names,
             {
+                "git_status",
+                "git_diff",
                 "list_files",
                 "read_file",
                 "search_code",
@@ -1591,6 +1630,12 @@ class WorkspaceTests(unittest.TestCase):
             replace_schema["required"],
             ["path", "old_text", "new_text"],
         )
+        self.assertEqual(
+            git_status_schema["properties"]["max_results"]["maximum"],
+            200,
+        )
+        self.assertEqual(set(git_diff_schema["properties"]), {"path"})
+        self.assertNotIn("command", git_diff_schema["properties"])
         self.assertEqual(
             replace_schema["properties"]["expected_replacements"]["default"],
             1,
@@ -1860,6 +1905,143 @@ class WorkspaceTests(unittest.TestCase):
 
         with self.assertRaisesRegex(WorkspaceError, "敏感目录"):
             self.workspace.read_file(".git/config")
+
+    def test_git_status_and_head_diff_report_visible_changes(self) -> None:
+        self.initialize_git_repository()
+        (self.root / "src" / "app.py").write_text(
+            "def greet(name):\n    return name\n",
+            encoding="utf-8",
+        )
+        (self.root / "README.md").write_text("# Changed\n", encoding="utf-8")
+        (self.root / "new.py").write_text("UNTRACKED_SECRET = 'not in diff'\n", encoding="utf-8")
+
+        status = self.workspace.git_status()
+        scoped_diff = self.workspace.git_diff("src")
+
+        entries = {entry["path"]: entry for entry in status["entries"]}
+        self.assertTrue(status["ok"])
+        self.assertEqual(status["repository_root"], ".")
+        self.assertIsNotNone(status["branch"])
+        self.assertEqual(len(status["head"]), 12)
+        self.assertEqual(entries["src/app.py"]["kind"], "modified")
+        self.assertTrue(entries["src/app.py"]["unstaged"])
+        self.assertTrue(entries["new.py"]["untracked"])
+        self.assertEqual(status["counts"]["unstaged"], 2)
+        self.assertEqual(status["counts"]["untracked"], 1)
+        self.assertEqual(scoped_diff["changed_files"], ["src/app.py"])
+        self.assertEqual(scoped_diff["untracked_files"], 0)
+        self.assertIn("-    return f'Hello, {name}'", scoped_diff["diff"])
+        self.assertIn("+    return name", scoped_diff["diff"])
+        self.assertNotIn("README.md", scoped_diff["diff"])
+        self.assertNotIn("UNTRACKED_SECRET", scoped_diff["diff"])
+
+    def test_git_status_parses_staged_rename_without_ambiguous_paths(self) -> None:
+        self.initialize_git_repository()
+        self.run_git("mv", "README.md", "GUIDE.md")
+
+        status = self.workspace.git_status()
+        diff = self.workspace.git_diff()
+
+        rename = next(entry for entry in status["entries"] if entry["kind"] == "renamed")
+        self.assertEqual(rename["path"], "GUIDE.md")
+        self.assertEqual(rename["original_path"], "README.md")
+        self.assertTrue(rename["staged"])
+        self.assertEqual(diff["changed_files"], ["GUIDE.md"])
+        self.assertIn("rename from README.md", diff["diff"])
+        self.assertIn("rename to GUIDE.md", diff["diff"])
+
+    def test_git_tools_hide_sensitive_and_control_plane_changes(self) -> None:
+        self.initialize_git_repository()
+        env_path = self.root / ".env"
+        config_path = self.root / "safe-patch-agent.toml"
+        env_path.write_text("API_KEY=old-secret\n", encoding="utf-8")
+        config_path.write_text("command = ['old-secret']\n", encoding="utf-8")
+        self.run_git("add", "-f", "--", ".env", "safe-patch-agent.toml")
+        self.run_git(
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "add protected files",
+        )
+        env_path.write_text("API_KEY=new-secret\n", encoding="utf-8")
+        config_path.write_text("command = ['new-secret']\n", encoding="utf-8")
+        (self.root / "src" / "app.py").write_text("SAFE_CHANGE = True\n", encoding="utf-8")
+        workspace = SafeWorkspace(self.root, protected_paths=(config_path,))
+
+        status = workspace.git_status()
+        diff = workspace.git_diff()
+
+        self.assertEqual(
+            [entry["path"] for entry in status["entries"]],
+            ["src/app.py"],
+        )
+        self.assertEqual(status["hidden_entries"], 2)
+        self.assertEqual(diff["changed_files"], ["src/app.py"])
+        self.assertEqual(diff["hidden_entries"], 2)
+        self.assertNotIn(".env", diff["diff"])
+        self.assertNotIn("safe-patch-agent.toml", diff["diff"])
+        self.assertNotIn("new-secret", diff["diff"])
+        with self.assertRaisesRegex(WorkspaceError, "敏感文件"):
+            workspace.git_diff(".env")
+        with self.assertRaisesRegex(WorkspaceError, "控制面配置"):
+            workspace.git_diff("safe-patch-agent.toml")
+
+    def test_git_tools_reject_parent_repository_and_non_repository(self) -> None:
+        if shutil.which("git") is None:
+            self.skipTest("当前环境没有 Git")
+        with self.assertRaisesRegex(WorkspaceError, "不是 Git 仓库"):
+            self.workspace.git_status()
+
+        self.initialize_git_repository()
+        child = self.root / "child"
+        child.mkdir()
+        child_workspace = SafeWorkspace(child)
+        with self.assertRaisesRegex(WorkspaceError, "仓库根目录一致"):
+            child_workspace.git_status()
+
+    def test_git_invocation_disables_mutating_or_extensible_behaviors(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=b"",
+            stderr=b"",
+        )
+        with patch("safe_patch_agent.workspace.subprocess.run", return_value=completed) as run:
+            self.workspace._invoke_read_only_git(("status", "--porcelain=v1", "-z"))
+
+        command = run.call_args.args[0]
+        options = run.call_args.kwargs
+        self.assertIn("--no-pager", command)
+        self.assertIn("--literal-pathspecs", command)
+        self.assertIn("core.fsmonitor=false", command)
+        self.assertIn("submodule.recurse=false", command)
+        self.assertEqual(command[-3:], ["status", "--porcelain=v1", "-z"])
+        self.assertFalse(options["shell"])
+        self.assertFalse(options["check"])
+        self.assertTrue(options["capture_output"])
+        self.assertEqual(options["env"]["GIT_OPTIONAL_LOCKS"], "0")
+        self.assertEqual(options["env"]["GIT_TERMINAL_PROMPT"], "0")
+
+    def test_git_status_parser_rejects_malformed_records(self) -> None:
+        entries = SafeWorkspace._parse_git_status(
+            "R  new name.py\x00old name.py\x00?? fresh.py\x00"
+        )
+
+        self.assertEqual(entries[0].path, "new name.py")
+        self.assertEqual(entries[0].original_path, "old name.py")
+        self.assertTrue(entries[1].untracked)
+        with self.assertRaisesRegex(WorkspaceError, "无法解析"):
+            SafeWorkspace._parse_git_status("malformed\x00")
+
+    def test_git_diff_output_is_bounded(self) -> None:
+        with patch.object(SafeWorkspace, "_MAX_GIT_DIFF_CHARS", 100):
+            output, truncated = SafeWorkspace._truncate_git_diff("x" * 500)
+
+        self.assertTrue(truncated)
+        self.assertLessEqual(len(output), 100)
+        self.assertIn("Git 差异已截断", output)
 
     def test_env_example_remains_readable(self) -> None:
         (self.root / ".env.example").write_text("API_KEY=replace-me\n", encoding="utf-8")

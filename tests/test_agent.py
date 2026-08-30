@@ -183,6 +183,8 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(
             {tool["function"]["name"] for tool in client.requests[0][1]},
             {
+                "git_status",
+                "git_diff",
                 "list_files",
                 "read_file",
                 "replace_text",
