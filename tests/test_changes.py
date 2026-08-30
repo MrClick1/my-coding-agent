@@ -89,6 +89,29 @@ class ChangeJournalTests(unittest.TestCase):
         self.assertIsNone(second.test_passed)
         self.assertEqual(journal.pending_rollback_paths, ())
 
+    def test_named_validation_results_are_accumulated_per_change(self) -> None:
+        journal = ChangeJournal()
+        record = journal.record(
+            path="demo.py",
+            before_text="old",
+            after_text="new",
+            diff="diff",
+            replacements=1,
+        )
+
+        journal.record_validation_result("tests", True)
+        journal.record_validation_result("lint", False)
+
+        summary = journal.summaries()[0]
+        self.assertFalse(record.test_passed)
+        self.assertEqual(
+            summary.validation_results,
+            (("lint", False), ("tests", True)),
+        )
+
+        journal.record_validation_result("lint", True)
+        self.assertTrue(record.test_passed)
+
     def test_rollback_selection_is_newest_first(self) -> None:
         journal = ChangeJournal()
         for index in range(3):

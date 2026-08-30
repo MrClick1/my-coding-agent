@@ -1,0 +1,11 @@
+[validation.tasks.tests]
+description = "运行项目 pytest 测试"
+command = ["{python}", "-m", "pytest", "-q"]
+timeout_seconds = 120
+required = true
+
+[validation.tasks.lint]
+description = "运行 Ruff 代码检查"
+command = ["{python}", "-m", "ruff", "check", "."]
+timeout_seconds = 120
+required = false

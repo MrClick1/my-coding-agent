@@ -1,8 +1,14 @@
+import sys
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from safe_patch_agent.config import ConfigurationError, LLMConfig, read_env_file
+from safe_patch_agent.config import (
+    ConfigurationError,
+    LLMConfig,
+    ValidationConfig,
+    read_env_file,
+)
 
 
 class ConfigTests(unittest.TestCase):
@@ -75,6 +81,72 @@ class ConfigTests(unittest.TestCase):
                 read_env_file(path),
                 {"LLM_API_KEY": "abc", "LLM_MODEL": "demo"},
             )
+
+    def test_validation_config_loads_frozen_named_tasks(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "safe-patch-agent.toml"
+            path.write_text(
+                """[validation.tasks.tests]
+description = "Run tests"
+command = ["{python}", "-m", "pytest", "-q"]
+timeout_seconds = 45
+required = true
+
+[validation.tasks.lint]
+description = "Run lint"
+command = ["ruff", "check", "."]
+required = false
+""",
+                encoding="utf-8",
+            )
+
+            config = ValidationConfig.load(path)
+
+        self.assertEqual(config.task_names, ("tests", "lint"))
+        self.assertEqual(config.required_names, ("tests",))
+        self.assertEqual(config.get("tests").resolved_command[0], sys.executable)
+        self.assertEqual(config.get("tests").display_command, "python -m pytest -q")
+        self.assertEqual(config.get("tests").timeout_seconds, 45.0)
+
+    def test_missing_validation_config_uses_compatible_pytest_default(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            config = ValidationConfig.load(
+                Path(temporary_directory) / "missing.toml"
+            )
+
+        self.assertEqual(config.task_names, ("tests",))
+        self.assertEqual(config.required_names, ("tests",))
+        self.assertEqual(
+            config.get("tests").resolved_command,
+            (sys.executable, "-m", "pytest", "-q"),
+        )
+
+    def test_validation_config_rejects_shell_string_and_missing_required_task(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "safe-patch-agent.toml"
+            path.write_text(
+                """[validation.tasks.tests]
+description = "Unsafe"
+command = "pytest -q && echo unsafe"
+required = true
+""",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ConfigurationError, "字符串数组"):
+                ValidationConfig.load(path)
+
+            path.write_text(
+                """[validation.tasks.tests]
+description = "Optional"
+command = ["pytest", "-q"]
+required = false
+""",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ConfigurationError, "至少需要一个"):
+                ValidationConfig.load(path)
 
 
 if __name__ == "__main__":

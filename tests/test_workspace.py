@@ -8,6 +8,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from safe_patch_agent.changes import ChangeJournal, ChangeKind
+from safe_patch_agent.config import ValidationConfig, ValidationTask
 from safe_patch_agent.messages import ToolCall
 from safe_patch_agent.workspace import (
     BatchChangePreview,
@@ -1208,6 +1209,10 @@ class WorkspaceTests(unittest.TestCase):
             SafeWorkspace(self.root, deletion_approval=True)  # type: ignore[arg-type]
         with self.assertRaisesRegex(WorkspaceError, "batch_change_approval"):
             SafeWorkspace(self.root, batch_change_approval=True)  # type: ignore[arg-type]
+        with self.assertRaisesRegex(WorkspaceError, "validation_config"):
+            SafeWorkspace(self.root, validation_config=True)  # type: ignore[arg-type]
+        with self.assertRaisesRegex(WorkspaceError, "protected_paths"):
+            SafeWorkspace(self.root, protected_paths="config.toml")  # type: ignore[arg-type]
 
     def test_replace_text_honors_rejection(self) -> None:
         target = self.root / "replace.py"
@@ -1562,6 +1567,11 @@ class WorkspaceTests(unittest.TestCase):
             for schema in registry.schemas()
             if schema["function"]["name"] == "apply_change_set"
         )["function"]["parameters"]
+        validation_schema = next(
+            schema
+            for schema in registry.schemas()
+            if schema["function"]["name"] == "run_validation"
+        )["function"]["parameters"]
 
         self.assertEqual(
             tool_names,
@@ -1573,6 +1583,7 @@ class WorkspaceTests(unittest.TestCase):
                 "create_file",
                 "delete_file",
                 "apply_change_set",
+                "run_validation",
                 "run_tests",
             },
         )
@@ -1589,8 +1600,114 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(delete_schema["required"], ["path"])
         self.assertEqual(batch_schema["required"], ["operations"])
         self.assertEqual(batch_schema["properties"]["operations"]["maxItems"], 20)
+        self.assertEqual(validation_schema["required"], ["name"])
+        self.assertEqual(
+            validation_schema["properties"]["name"]["enum"],
+            ["tests"],
+        )
 
-    def test_run_tests_uses_fixed_command_and_sanitized_environment(self) -> None:
+    def test_named_required_validations_use_frozen_commands_and_state_gate(self) -> None:
+        validation_config = ValidationConfig(
+            tasks=(
+                ValidationTask(
+                    "tests",
+                    "Run tests",
+                    ("{python}", "-m", "pytest", "-q"),
+                    required=True,
+                ),
+                ValidationTask(
+                    "lint",
+                    "Run lint",
+                    ("{python}", "-m", "ruff", "check", "."),
+                    timeout_seconds=30,
+                    required=True,
+                ),
+            )
+        )
+        workspace = SafeWorkspace(
+            self.root,
+            validation_config=validation_config,
+        )
+        registry = build_agent_registry(workspace)
+        registry.state.mark_file_modified("src/app.py")
+        completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="passed\n",
+        )
+
+        with patch("safe_patch_agent.workspace.subprocess.run", return_value=completed) as run:
+            lint = json.loads(
+                registry.execute(
+                    ToolCall(
+                        id="lint",
+                        name="run_validation",
+                        arguments={"name": "lint"},
+                    )
+                )
+            )
+            after_lint = registry.state.snapshot()
+            tests = json.loads(
+                registry.execute(ToolCall(id="tests", name="run_tests", arguments={}))
+            )
+
+        self.assertTrue(lint["passed"])
+        self.assertEqual(lint["name"], "lint")
+        self.assertEqual(
+            run.call_args_list[0].args[0],
+            [sys.executable, "-m", "ruff", "check", "."],
+        )
+        self.assertEqual(run.call_args_list[0].kwargs["timeout"], 30.0)
+        self.assertFalse(run.call_args_list[0].kwargs["shell"])
+        self.assertTrue(after_lint.has_unverified_changes)
+        self.assertEqual(after_lint.pending_validations, ("tests",))
+        self.assertTrue(tests["passed"])
+        self.assertFalse(registry.state.snapshot().has_unverified_changes)
+        self.assertEqual(registry.state.snapshot().validation_runs, 2)
+
+    def test_unknown_validation_name_never_starts_a_process(self) -> None:
+        with (
+            patch("safe_patch_agent.workspace.subprocess.run") as run,
+            self.assertRaisesRegex(WorkspaceError, "可用任务：tests"),
+        ):
+            self.workspace.run_validation("shell")
+
+        run.assert_not_called()
+
+    def test_protected_control_config_is_hidden_from_all_agent_file_tools(self) -> None:
+        config_path = self.root / "safe-patch-agent.toml"
+        config_path.write_text("control = true\n", encoding="utf-8")
+        workspace = SafeWorkspace(
+            self.root,
+            replacement_approval=lambda _preview: True,
+            deletion_approval=lambda _preview: True,
+            protected_paths=(config_path,),
+        )
+
+        listed = workspace.list_files()
+        listed_paths = {entry["path"] for entry in listed["entries"]}
+        self.assertNotIn("safe-patch-agent.toml", listed_paths)
+        self.assertEqual(workspace.search_code("control")["matches"], [])
+        with self.assertRaisesRegex(WorkspaceError, "控制面配置"):
+            workspace.read_file("safe-patch-agent.toml")
+        with self.assertRaisesRegex(WorkspaceError, "控制面配置"):
+            workspace.create_file("safe-patch-agent.toml", "replacement = true\n")
+        with self.assertRaisesRegex(WorkspaceError, "控制面配置"):
+            workspace.replace_text("safe-patch-agent.toml", "true", "false")
+        with self.assertRaisesRegex(WorkspaceError, "控制面配置"):
+            workspace.delete_file("safe-patch-agent.toml")
+        with self.assertRaisesRegex(WorkspaceError, "控制面配置"):
+            workspace.apply_change_set(
+                [
+                    {
+                        "kind": "create",
+                        "path": "safe-patch-agent.toml",
+                        "content": "replacement = true\n",
+                    }
+                ]
+            )
+
+    def test_run_tests_uses_default_named_task_and_sanitized_environment(self) -> None:
         with (
             patch.dict(
                 os.environ,

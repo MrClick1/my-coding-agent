@@ -16,7 +16,7 @@ from safe_patch_agent.agent import (
     CodingSession,
 )
 from safe_patch_agent.changes import ChangeJournal, ChangeKind
-from safe_patch_agent.config import ConfigurationError, LLMConfig
+from safe_patch_agent.config import ConfigurationError, LLMConfig, ValidationConfig
 from safe_patch_agent.llm_client import LLMError, OpenAICompatibleClient
 from safe_patch_agent.workspace import (
     BatchChangePreview,
@@ -81,6 +81,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path(".env"),
         help="简化的 KEY=VALUE 配置文件（默认：.env）",
+    )
+    parser.add_argument(
+        "--validation-config",
+        type=Path,
+        default=None,
+        help=(
+            "具名验证任务 TOML；相对路径基于工作区"
+            "（默认：工作区/safe-patch-agent.toml，不存在则使用 pytest）"
+        ),
     )
     parser.add_argument(
         "--max-rounds",
@@ -295,9 +304,19 @@ def format_change_log(journal: ChangeJournal) -> str:
         if item.rolled_back:
             status = "已回滚"
         elif item.test_passed is True:
-            status = "测试通过"
+            status = (
+                "测试通过"
+                if tuple(name for name, _passed in item.validation_results)
+                == ("tests",)
+                else "验证通过"
+            )
         elif item.test_passed is False:
-            status = "测试失败"
+            status = (
+                "测试失败"
+                if tuple(name for name, _passed in item.validation_results)
+                == ("tests",)
+                else "验证失败"
+            )
         else:
             status = "待测试"
         before_hash = (
@@ -320,9 +339,16 @@ def format_change_log(journal: ChangeJournal) -> str:
             ChangeKind.REPLACE: f"替换 {item.replacements} 处",
             ChangeKind.DELETE: "删除文件",
         }[item.kind]
+        validation_detail = ""
+        if item.validation_results:
+            rendered_results = ", ".join(
+                f"{name}={'通过' if passed else '失败'}"
+                for name, passed in item.validation_results
+            )
+            validation_detail = f"；验证 {rendered_results}"
         lines.append(
             f"  #{item.change_id} [{status}][{kind}] {item.path}；"
-            f"SHA-256 {before_hash} -> {after_hash}；{detail}"
+            f"SHA-256 {before_hash} -> {after_hash}；{detail}{validation_detail}"
         )
     pending_paths = journal.pending_rollback_paths
     if pending_paths:
@@ -528,14 +554,22 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         config = LLMConfig.load(args.env_file)
+        workspace_root = args.workspace.expanduser().resolve()
+        validation_path = args.validation_config or Path("safe-patch-agent.toml")
+        if not validation_path.is_absolute():
+            validation_path = workspace_root / validation_path
+        validation_path = validation_path.expanduser().resolve(strict=False)
+        validation_config = ValidationConfig.load(validation_path)
         interactive = args.chat or args.goal is None
         change_journal = ChangeJournal() if interactive else None
         workspace = SafeWorkspace(
-            args.workspace,
+            workspace_root,
             replacement_approval=request_replacement_approval,
             creation_approval=request_creation_approval,
             deletion_approval=request_deletion_approval,
             batch_change_approval=request_batch_change_approval,
+            validation_config=validation_config,
+            protected_paths=(validation_path,),
             change_journal=change_journal,
             rollback_approval=request_rollback_approval,
         )

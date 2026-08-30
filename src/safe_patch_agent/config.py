@@ -6,6 +6,8 @@ import ipaddress
 import math
 import os
 import re
+import sys
+import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -17,6 +19,7 @@ class ConfigurationError(ValueError):
 
 
 _ENV_KEY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_VALIDATION_NAME_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,31}$")
 
 
 def _is_loopback_host(hostname: str | None) -> bool:
@@ -61,6 +64,181 @@ def read_env_file(path: Path) -> dict[str, str]:
             value = value[1:-1]
         values[key] = value
     return values
+
+
+@dataclass(frozen=True)
+class ValidationTask:
+    """由用户配置、只能按名称调用的一项固定验证命令。"""
+
+    name: str
+    description: str
+    command: tuple[str, ...]
+    timeout_seconds: float = 120.0
+    required: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or not _VALIDATION_NAME_PATTERN.fullmatch(
+            self.name
+        ):
+            raise ConfigurationError(
+                "验证任务名称必须以字母开头，且只能包含字母、数字、下划线和连字符"
+            )
+        if not isinstance(self.description, str):
+            raise ConfigurationError("验证任务 description 必须是字符串")
+        description = self.description.strip()
+        if not description or len(description) > 300:
+            raise ConfigurationError("验证任务 description 必须为 1 到 300 个字符")
+        if not isinstance(self.command, tuple) or not 1 <= len(self.command) <= 32:
+            raise ConfigurationError("验证任务 command 必须包含 1 到 32 个参数")
+        for argument in self.command:
+            if (
+                not isinstance(argument, str)
+                or not argument
+                or "\x00" in argument
+                or len(argument) > 1_000
+            ):
+                raise ConfigurationError(
+                    "验证任务 command 参数必须是 1 到 1000 个字符的安全字符串"
+                )
+        if (
+            isinstance(self.timeout_seconds, bool)
+            or not isinstance(self.timeout_seconds, (int, float))
+            or not math.isfinite(self.timeout_seconds)
+            or not 1 <= self.timeout_seconds <= 600
+        ):
+            raise ConfigurationError("验证任务 timeout_seconds 必须在 1 到 600 之间")
+        if not isinstance(self.required, bool):
+            raise ConfigurationError("验证任务 required 必须是布尔值")
+        object.__setattr__(self, "description", description)
+        object.__setattr__(self, "timeout_seconds", float(self.timeout_seconds))
+
+    @property
+    def resolved_command(self) -> tuple[str, ...]:
+        """展开受支持的 Python 解释器占位符，但不进行 Shell 求值。"""
+
+        return tuple(
+            sys.executable if argument == "{python}" else argument
+            for argument in self.command
+        )
+
+    @property
+    def display_command(self) -> str:
+        """返回不暴露虚拟环境绝对路径的可读命令。"""
+
+        return " ".join(
+            "python" if argument == "{python}" else argument
+            for argument in self.command
+        )
+
+
+@dataclass(frozen=True)
+class ValidationConfig:
+    """启动时冻结的具名验证任务集合。"""
+
+    tasks: tuple[ValidationTask, ...]
+
+    _MAX_CONFIG_BYTES = 64_000
+    _MAX_TASKS = 20
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.tasks, tuple) or not 1 <= len(self.tasks) <= self._MAX_TASKS:
+            raise ConfigurationError(
+                f"验证配置必须包含 1 到 {self._MAX_TASKS} 个任务"
+            )
+        if any(not isinstance(task, ValidationTask) for task in self.tasks):
+            raise ConfigurationError("验证配置 tasks 必须只包含 ValidationTask")
+        names = [task.name for task in self.tasks]
+        if len(set(names)) != len(names):
+            raise ConfigurationError("验证任务名称不能重复")
+        if "tests" not in names:
+            raise ConfigurationError("验证配置必须包含兼容任务 tests")
+        if not any(task.required for task in self.tasks):
+            raise ConfigurationError("验证配置至少需要一个 required = true 的任务")
+
+    @property
+    def task_names(self) -> tuple[str, ...]:
+        return tuple(task.name for task in self.tasks)
+
+    @property
+    def required_names(self) -> tuple[str, ...]:
+        return tuple(task.name for task in self.tasks if task.required)
+
+    def get(self, name: str) -> ValidationTask:
+        for task in self.tasks:
+            if task.name == name:
+                return task
+        raise ConfigurationError(f"未知验证任务：{name}")
+
+    @classmethod
+    def default(cls) -> ValidationConfig:
+        """返回与旧版固定 pytest 行为兼容的默认配置。"""
+
+        return cls(
+            tasks=(
+                ValidationTask(
+                    name="tests",
+                    description="运行项目 pytest 测试",
+                    command=("{python}", "-m", "pytest", "-q"),
+                    timeout_seconds=120,
+                    required=True,
+                ),
+            )
+        )
+
+    @classmethod
+    def load(cls, path: Path) -> ValidationConfig:
+        """从专用 TOML 文件加载任务；文件不存在时使用兼容默认值。"""
+
+        if not path.exists():
+            return cls.default()
+        if not path.is_file():
+            raise ConfigurationError(f"验证配置路径不是文件：{path}")
+        try:
+            raw_content = path.read_bytes()
+        except OSError as exc:
+            raise ConfigurationError(f"无法读取验证配置：{path}") from exc
+        if len(raw_content) > cls._MAX_CONFIG_BYTES:
+            raise ConfigurationError(
+                f"验证配置超过 {cls._MAX_CONFIG_BYTES} 字节上限"
+            )
+        try:
+            data = tomllib.loads(raw_content.decode("utf-8"))
+        except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+            raise ConfigurationError("验证配置不是有效的 UTF-8 TOML") from exc
+        if set(data) != {"validation"}:
+            raise ConfigurationError("验证配置顶层只能包含 [validation]")
+        validation = data.get("validation")
+        if not isinstance(validation, Mapping) or set(validation) != {"tasks"}:
+            raise ConfigurationError("[validation] 必须且只能包含 tasks")
+        raw_tasks = validation.get("tasks")
+        if not isinstance(raw_tasks, Mapping):
+            raise ConfigurationError("[validation.tasks] 必须包含具名任务表")
+
+        tasks: list[ValidationTask] = []
+        allowed_fields = {"description", "command", "timeout_seconds", "required"}
+        for name, raw_task in raw_tasks.items():
+            if not isinstance(name, str) or not isinstance(raw_task, Mapping):
+                raise ConfigurationError("每个验证任务都必须是 TOML 表")
+            unexpected = set(raw_task) - allowed_fields
+            if unexpected:
+                fields = ", ".join(sorted(str(field) for field in unexpected))
+                raise ConfigurationError(f"验证任务 {name} 包含未知字段：{fields}")
+            command = raw_task.get("command")
+            if not isinstance(command, list):
+                raise ConfigurationError(f"验证任务 {name} 的 command 必须是字符串数组")
+            try:
+                command_tuple = tuple(command)
+                task = ValidationTask(
+                    name=name,
+                    description=raw_task.get("description", name),
+                    command=command_tuple,
+                    timeout_seconds=raw_task.get("timeout_seconds", 120),
+                    required=raw_task.get("required", False),
+                )
+            except TypeError as exc:
+                raise ConfigurationError(f"验证任务 {name} 的字段类型无效") from exc
+            tasks.append(task)
+        return cls(tuple(tasks))
 
 
 @dataclass(frozen=True)

@@ -87,12 +87,16 @@ class CLITests(unittest.TestCase):
         chat_args = parser.parse_args([])
         initial_chat_args = parser.parse_args(["初始任务", "--chat"])
         no_stream_args = parser.parse_args(["任务", "--no-stream"])
+        validation_args = parser.parse_args(
+            ["任务", "--validation-config", "checks.toml"]
+        )
 
         self.assertIsNone(chat_args.goal)
         self.assertFalse(chat_args.chat)
         self.assertEqual(initial_chat_args.goal, "初始任务")
         self.assertTrue(initial_chat_args.chat)
         self.assertTrue(no_stream_args.no_stream)
+        self.assertEqual(validation_args.validation_config, Path("checks.toml"))
 
     def test_missing_model_configuration_returns_clear_error(self) -> None:
         with TemporaryDirectory() as temporary_directory:
@@ -112,6 +116,44 @@ class CLITests(unittest.TestCase):
 
         self.assertEqual(exit_code, 1)
         self.assertIn("缺少必需配置", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+
+    def test_invalid_named_validation_config_returns_clear_error(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            validation_path = root / "checks.toml"
+            validation_path.write_text(
+                """[validation.tasks.tests]
+description = "bad"
+command = "pytest -q"
+required = true
+""",
+                encoding="utf-8",
+            )
+            stderr = StringIO()
+            environment = {
+                "LLM_API_KEY": "key",
+                "LLM_BASE_URL": "https://example.test/v1",
+                "LLM_MODEL": "model",
+            }
+            with (
+                patch.dict(os.environ, environment, clear=True),
+                redirect_stderr(stderr),
+            ):
+                exit_code = main(
+                    [
+                        "inspect",
+                        "--workspace",
+                        str(root),
+                        "--env-file",
+                        str(root / "missing.env"),
+                        "--validation-config",
+                        "checks.toml",
+                    ]
+                )
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("command 必须是字符串数组", stderr.getvalue())
         self.assertNotIn("Traceback", stderr.getvalue())
 
     def test_replacement_approval_shows_diff_and_accepts_explicit_yes(self) -> None:
@@ -317,6 +359,16 @@ class CLITests(unittest.TestCase):
             before_text="value = 1\n",
             diff="diff",
         )
+        validated = ChangeJournal()
+        validated.record(
+            path="checked.py",
+            before_text="old",
+            after_text="new",
+            diff="diff",
+            replacements=1,
+        )
+        validated.record_validation_result("lint", True)
+        validated.record_validation_result("tests", False)
 
         self.assertIn("#1 [待测试][替换] demo.py", pending)
         self.assertIn("[测试通过]", tested)
@@ -326,6 +378,8 @@ class CLITests(unittest.TestCase):
         self.assertIn("SHA-256 （不存在）", format_change_log(created))
         self.assertIn("[删除] old.py", format_change_log(deleted))
         self.assertIn("-> （不存在）", format_change_log(deleted))
+        self.assertIn("[验证失败]", format_change_log(validated))
+        self.assertIn("验证 lint=通过, tests=失败", format_change_log(validated))
         self.assertIsNone(parse_rollback_target("/rollback"))
         self.assertEqual(parse_rollback_target("/rollback 3"), 3)
         self.assertEqual(parse_rollback_target("/rollback ALL"), "all")

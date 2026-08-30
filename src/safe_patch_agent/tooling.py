@@ -48,6 +48,7 @@ class ToolDefinition:
     path_normalizer: PathNormalizer | None = None
     file_access_resolver: FileAccessResolver | None = None
     records_test_result: bool = False
+    validation_name_argument: str | None = None
 
     def __post_init__(self) -> None:
         if not self.name:
@@ -90,6 +91,14 @@ class ToolDefinition:
         if not isinstance(self.records_test_result, bool):
             raise ToolRegistrationError(
                 f"工具 {self.name!r} 的 records_test_result 必须是布尔值"
+            )
+        if self.validation_name_argument is not None and (
+            not self.records_test_result
+            or not isinstance(self.validation_name_argument, str)
+            or not self.validation_name_argument
+        ):
+            raise ToolRegistrationError(
+                f"工具 {self.name!r} 的 validation_name_argument 配置无效"
             )
 
     def to_api_dict(self) -> dict[str, Any]:
@@ -165,7 +174,7 @@ class ToolRegistry:
                 payload = {"ok": True, "result": result}
             if payload.get("ok", True):
                 self._record_file_access(definition, accessed_paths, payload)
-                self._record_test_result(definition, payload)
+                self._record_test_result(definition, arguments, payload)
         except ValueError as exc:
             return _json_result(
                 {
@@ -261,6 +270,7 @@ class ToolRegistry:
     def _record_test_result(
         self,
         definition: ToolDefinition,
+        arguments: Mapping[str, Any],
         payload: Mapping[str, Any],
     ) -> None:
         """记录固定测试工具报告的通过或失败状态。"""
@@ -270,7 +280,13 @@ class ToolRegistry:
         passed = payload.get("passed")
         if not isinstance(passed, bool):
             raise ValueError("测试工具必须返回布尔类型的 passed 字段")
-        self.state.record_test_result(passed)
+        if definition.validation_name_argument is None:
+            self.state.record_test_result(passed)
+            return
+        name = arguments.get(definition.validation_name_argument)
+        if not isinstance(name, str) or not name:
+            raise ValueError("具名验证工具必须接收非空任务名称")
+        self.state.record_validation_result(name, passed)
 
 
 def _json_result(value: Any) -> str:

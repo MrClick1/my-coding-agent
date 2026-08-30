@@ -8,15 +8,15 @@ import os
 import re
 import stat
 import subprocess
-import sys
 import tempfile
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from safe_patch_agent.changes import ChangeJournal, ChangeJournalError, ChangeKind
+from safe_patch_agent.config import ConfigurationError, ValidationConfig
 from safe_patch_agent.tooling import ToolDefinition, ToolFileAccess, ToolRegistry
 
 
@@ -186,6 +186,8 @@ class SafeWorkspace:
         creation_approval: CreationApproval | None = None,
         deletion_approval: DeletionApproval | None = None,
         batch_change_approval: BatchChangeApproval | None = None,
+        validation_config: ValidationConfig | None = None,
+        protected_paths: Sequence[Path] = (),
         change_journal: ChangeJournal | None = None,
         rollback_approval: RollbackApproval | None = None,
     ) -> None:
@@ -204,11 +206,35 @@ class SafeWorkspace:
             raise WorkspaceError("batch_change_approval 必须是可调用对象")
         if rollback_approval is not None and not callable(rollback_approval):
             raise WorkspaceError("rollback_approval 必须是可调用对象")
+        if validation_config is not None and not isinstance(
+            validation_config, ValidationConfig
+        ):
+            raise WorkspaceError("validation_config 必须是 ValidationConfig")
+        if not isinstance(protected_paths, Sequence) or isinstance(
+            protected_paths, (str, bytes)
+        ):
+            raise WorkspaceError("protected_paths 必须是路径序列")
         self.root = resolved_root
         self.replacement_approval = replacement_approval
         self.creation_approval = creation_approval
         self.deletion_approval = deletion_approval
         self.batch_change_approval = batch_change_approval
+        self.validation_config = validation_config or ValidationConfig.default()
+        resolved_protected_paths: set[Path] = set()
+        for protected_path in protected_paths:
+            if not isinstance(protected_path, Path):
+                raise WorkspaceError("protected_paths 必须只包含 Path")
+            candidate = (
+                protected_path
+                if protected_path.is_absolute()
+                else self.root / protected_path
+            ).expanduser().resolve(strict=False)
+            try:
+                candidate.relative_to(self.root)
+            except ValueError:
+                continue
+            resolved_protected_paths.add(candidate)
+        self._protected_paths = frozenset(resolved_protected_paths)
         self.change_journal = change_journal
         self.rollback_approval = rollback_approval
 
@@ -1327,9 +1353,23 @@ class SafeWorkspace:
         return "".join(visible_lines)
 
     def run_tests(self) -> dict[str, Any]:
-        """在工作区运行参数固定、时间和输出受限的 pytest。"""
+        """兼容入口：运行具名的 tests 验证任务。"""
 
-        command = [sys.executable, "-m", "pytest", "-q"]
+        return self.run_validation("tests")
+
+    def run_validation(self, name: str) -> dict[str, Any]:
+        """按启动时冻结的名称运行固定验证任务，不接受模型命令参数。"""
+
+        if not isinstance(name, str) or not name:
+            raise WorkspaceError("验证任务名称必须是非空字符串")
+        try:
+            task = self.validation_config.get(name)
+        except ConfigurationError as exc:
+            available = ", ".join(self.validation_config.task_names)
+            raise WorkspaceError(
+                f"未知验证任务：{name}；可用任务：{available}"
+            ) from exc
+        command = list(task.resolved_command)
         started_at = time.monotonic()
         try:
             completed = subprocess.run(
@@ -1341,7 +1381,7 @@ class SafeWorkspace:
                 stderr=subprocess.STDOUT,
                 shell=False,
                 check=False,
-                timeout=self._TEST_TIMEOUT_SECONDS,
+                timeout=task.timeout_seconds,
                 encoding="utf-8",
                 errors="replace",
             )
@@ -1351,36 +1391,42 @@ class SafeWorkspace:
             )
             result = {
                 "ok": True,
+                "name": task.name,
+                "description": task.description,
+                "required": task.required,
                 "passed": False,
-                "command": "python -m pytest -q",
+                "command": task.display_command,
                 "exit_code": None,
                 "timed_out": True,
-                "timeout_seconds": self._TEST_TIMEOUT_SECONDS,
+                "timeout_seconds": task.timeout_seconds,
                 "duration_seconds": round(time.monotonic() - started_at, 3),
                 "output": output,
                 "output_truncated": output_truncated,
             }
             if self.change_journal is not None:
-                self.change_journal.record_test_result(False)
+                self.change_journal.record_validation_result(task.name, False)
             return result
         except OSError as exc:
-            raise WorkspaceError("无法启动固定的 pytest 测试命令") from exc
+            raise WorkspaceError(f"无法启动验证任务：{task.name}") from exc
 
         output, output_truncated = self._truncate_test_output(completed.stdout or "")
         passed = completed.returncode == 0
         result = {
             "ok": True,
+            "name": task.name,
+            "description": task.description,
+            "required": task.required,
             "passed": passed,
-            "command": "python -m pytest -q",
+            "command": task.display_command,
             "exit_code": completed.returncode,
             "timed_out": False,
-            "timeout_seconds": self._TEST_TIMEOUT_SECONDS,
+            "timeout_seconds": task.timeout_seconds,
             "duration_seconds": round(time.monotonic() - started_at, 3),
             "output": output,
             "output_truncated": output_truncated,
         }
         if self.change_journal is not None:
-            self.change_journal.record_test_result(passed)
+            self.change_journal.record_validation_result(task.name, passed)
         return result
 
     def _read_utf8_text(self, target: Path, display_path: str) -> tuple[str, int]:
@@ -1714,6 +1760,8 @@ class SafeWorkspace:
         return excerpt, True
 
     def _assert_read_allowed(self, path: Path) -> None:
+        if path in self._protected_paths:
+            raise WorkspaceError("禁止通过 Agent 工具访问控制面配置文件")
         relative = path.relative_to(self.root)
         lowered_parts = tuple(part.casefold() for part in relative.parts)
         if os.name == "nt" and any(":" in part for part in relative.parts):
@@ -1842,6 +1890,9 @@ def build_agent_registry(workspace: SafeWorkspace) -> ToolRegistry:
     """创建包含受控单项与批量文件变更能力的 Agent 工具注册表。"""
 
     registry = build_read_only_registry(workspace)
+    registry.state.configure_required_validations(
+        workspace.validation_config.required_names
+    )
     registry.register(
         ToolDefinition(
             name="replace_text",
@@ -1990,10 +2041,39 @@ def build_agent_registry(workspace: SafeWorkspace) -> ToolRegistry:
     )
     registry.register(
         ToolDefinition(
+            name="run_validation",
+            description=(
+                "运行启动时由用户固定配置的具名验证任务；模型只能选择名称，"
+                "不能提供命令或参数。可用任务："
+                + "；".join(
+                    f"{task.name}（{'必选' if task.required else '可选'}）："
+                    f"{task.description}"
+                    for task in workspace.validation_config.tasks
+                )
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "enum": list(workspace.validation_config.task_names),
+                        "description": "要运行的预配置验证任务名称。",
+                    },
+                },
+                "required": ["name"],
+                "additionalProperties": False,
+            },
+            handler=workspace.run_validation,
+            records_test_result=True,
+            validation_name_argument="name",
+        )
+    )
+    registry.register(
+        ToolDefinition(
             name="run_tests",
             description=(
-                "在工作区运行固定命令 python -m pytest -q。该工具不接受命令参数，"
-                "并返回通过状态、退出码和受限输出。每次修改后必须调用。"
+                "兼容入口：运行预配置的 tests 验证任务。该工具不接受命令参数，"
+                "并返回通过状态、退出码和受限输出。"
             ),
             parameters={
                 "type": "object",

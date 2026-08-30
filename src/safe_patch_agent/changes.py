@@ -36,6 +36,7 @@ class ChangeRecord:
     updated_bytes: int
     created_at: str
     test_passed: bool | None = None
+    validation_results: dict[str, bool] = field(default_factory=dict)
     rolled_back: bool = False
     before_text: str | None = field(default=None, repr=False)
     after_text: str | None = field(default=None, repr=False)
@@ -53,6 +54,7 @@ class ChangeSummary:
     after_sha256: str | None
     created_at: str
     test_passed: bool | None
+    validation_results: tuple[tuple[str, bool], ...]
     rolled_back: bool
 
 
@@ -224,6 +226,9 @@ class ChangeJournal:
                 after_sha256=record.after_sha256,
                 created_at=record.created_at,
                 test_passed=record.test_passed,
+                validation_results=tuple(
+                    sorted(record.validation_results.items(), key=lambda item: item[0])
+                ),
                 rolled_back=record.rolled_back,
             )
             for record in self._records
@@ -262,11 +267,19 @@ class ChangeJournal:
     def record_test_result(self, passed: bool) -> None:
         """把一次固定测试结果关联到此前尚未测试的活动修改。"""
 
+        self.record_validation_result("tests", passed)
+
+    def record_validation_result(self, name: str, passed: bool) -> None:
+        """把具名验证结果关联到此前尚未回滚的活动修改。"""
+
+        if not isinstance(name, str) or not name:
+            raise ChangeJournalError("验证任务名称必须是非空字符串")
         if not isinstance(passed, bool):
             raise ChangeJournalError("测试结果 passed 必须是布尔值")
         for record in self._records:
             if not record.rolled_back:
-                record.test_passed = passed
+                record.validation_results[name] = passed
+                record.test_passed = all(record.validation_results.values())
         self._pending_rollback_paths.clear()
 
 

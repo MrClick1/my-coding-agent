@@ -15,6 +15,7 @@ from safe_patch_agent.agent import (
     CodingAgent,
     CodingSession,
 )
+from safe_patch_agent.config import ValidationConfig, ValidationTask
 from safe_patch_agent.llm_client import ChatCompletion
 from safe_patch_agent.messages import ChatMessage, ToolCall
 from safe_patch_agent.tooling import ToolRegistry
@@ -188,6 +189,7 @@ class AgentTests(unittest.TestCase):
                 "create_file",
                 "delete_file",
                 "apply_change_set",
+                "run_validation",
                 "run_tests",
                 "search_code",
             },
@@ -573,11 +575,89 @@ class AgentTests(unittest.TestCase):
         self.assertFalse(result.state.has_unverified_changes)
         reminder = client.requests[3][0][-1]
         self.assertEqual(reminder.role.value, "system")
-        self.assertIn("必须调用 run_tests", reminder.content)
+        self.assertIn("待运行：tests", reminder.content)
         self.assertIn(
             AgentEventKind.VERIFICATION_REQUIRED,
             [event.kind for event in events],
         )
+
+    def test_agent_requires_every_configured_required_validation(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            target = root / "demo.py"
+            target.write_text("old\n", encoding="utf-8")
+            validation_config = ValidationConfig(
+                tasks=(
+                    ValidationTask(
+                        "tests",
+                        "Run tests",
+                        ("{python}", "-m", "pytest", "-q"),
+                        required=True,
+                    ),
+                    ValidationTask(
+                        "lint",
+                        "Run lint",
+                        ("{python}", "-m", "ruff", "check", "."),
+                        required=True,
+                    ),
+                )
+            )
+            workspace = SafeWorkspace(
+                root,
+                replacement_approval=lambda _preview: True,
+                validation_config=validation_config,
+            )
+            registry = build_agent_registry(workspace)
+            read_call = ToolCall(
+                id="read",
+                name="read_file",
+                arguments={"path": "demo.py"},
+            )
+            replace_call = ToolCall(
+                id="replace",
+                name="replace_text",
+                arguments={"path": "demo.py", "old_text": "old", "new_text": "new"},
+            )
+            lint_call = ToolCall(
+                id="lint",
+                name="run_validation",
+                arguments={"name": "lint"},
+            )
+            tests_call = ToolCall(id="tests", name="run_tests", arguments={})
+            client = ScriptedClient(
+                [
+                    ChatCompletion(ChatMessage.assistant(None, (read_call,)), "tool_calls"),
+                    ChatCompletion(
+                        ChatMessage.assistant(None, (replace_call,)),
+                        "tool_calls",
+                    ),
+                    ChatCompletion(ChatMessage.assistant("已修改。"), "stop"),
+                    ChatCompletion(
+                        ChatMessage.assistant(None, (lint_call,)),
+                        "tool_calls",
+                    ),
+                    ChatCompletion(ChatMessage.assistant("lint 完成。"), "stop"),
+                    ChatCompletion(
+                        ChatMessage.assistant(None, (tests_call,)),
+                        "tool_calls",
+                    ),
+                    ChatCompletion(ChatMessage.assistant("全部验证完成。"), "stop"),
+                ]
+            )
+
+            with patch("safe_patch_agent.workspace.subprocess.run") as run:
+                run.return_value.returncode = 0
+                run.return_value.stdout = "passed\n"
+                result = CodingAgent(client, registry).run("修改并执行全部验证")
+
+        self.assertEqual(result.answer, "全部验证完成。")
+        self.assertEqual(result.state.validation_runs, 2)
+        self.assertEqual(result.state.pending_validations, ())
+        self.assertFalse(result.state.has_unverified_changes)
+        first_reminder = client.requests[3][0][-1]
+        second_reminder = client.requests[5][0][-1]
+        self.assertIn("待运行：tests, lint", first_reminder.content)
+        self.assertIn("待运行：tests", second_reminder.content)
 
     def test_agent_errors_when_round_limit_prevents_required_test(self) -> None:
         with TemporaryDirectory() as temporary_directory:
@@ -602,7 +682,7 @@ class AgentTests(unittest.TestCase):
                 ]
             )
 
-            with self.assertRaisesRegex(AgentVerificationError, "没有运行测试"):
+            with self.assertRaisesRegex(AgentVerificationError, "没有运行全部必选验证"):
                 CodingAgent(client, registry, max_rounds=3).run("修改")
 
     def test_unverified_change_survives_into_next_agent_turn(self) -> None:
@@ -670,7 +750,7 @@ class AgentTests(unittest.TestCase):
         self.assertTrue(result.state.last_test_passed)
         reminder = second_client.requests[1][0][-1]
         self.assertEqual(reminder.role.value, "system")
-        self.assertIn("必须调用 run_tests", reminder.content)
+        self.assertIn("待运行：tests", reminder.content)
 
     def test_session_keeps_compact_answers_but_not_old_tool_messages(self) -> None:
         with TemporaryDirectory() as temporary_directory:

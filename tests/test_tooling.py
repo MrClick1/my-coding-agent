@@ -371,6 +371,60 @@ class ToolingTests(unittest.TestCase):
         self.assertEqual(result["error"]["type"], "tool_error")
         self.assertEqual(registry.state.snapshot().test_runs, 0)
 
+    def test_named_validation_tool_clears_only_its_required_task(self) -> None:
+        registry = ToolRegistry()
+        registry.state.configure_required_validations(("tests", "lint"))
+        registry.state.mark_file_modified("demo.py")
+        registry.register(
+            ToolDefinition(
+                "run_validation",
+                "验证",
+                {"type": "object"},
+                lambda name: {"ok": True, "name": name, "passed": True},
+                records_test_result=True,
+                validation_name_argument="name",
+            )
+        )
+
+        lint = json.loads(
+            registry.execute(
+                ToolCall(
+                    id="lint",
+                    name="run_validation",
+                    arguments={"name": "lint"},
+                )
+            )
+        )
+        after_lint = registry.state.snapshot()
+        tests = json.loads(
+            registry.execute(
+                ToolCall(
+                    id="tests",
+                    name="run_validation",
+                    arguments={"name": "tests"},
+                )
+            )
+        )
+
+        self.assertTrue(lint["ok"])
+        self.assertTrue(after_lint.has_unverified_changes)
+        self.assertEqual(after_lint.pending_validations, ("tests",))
+        self.assertTrue(tests["ok"])
+        snapshot = registry.state.snapshot()
+        self.assertFalse(snapshot.has_unverified_changes)
+        self.assertEqual(snapshot.validation_runs, 2)
+        self.assertEqual(snapshot.test_runs, 1)
+
+    def test_validation_name_argument_requires_result_recording(self) -> None:
+        with self.assertRaisesRegex(ToolRegistrationError, "配置无效"):
+            ToolDefinition(
+                "invalid",
+                "验证",
+                {"type": "object"},
+                lambda name: name,
+                validation_name_argument="name",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
